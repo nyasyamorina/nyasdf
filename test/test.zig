@@ -50,8 +50,7 @@ test "nyasdf.Content" {
     try std.testing.expectEqual(d3, d7.payload.pair.get0());
     try std.testing.expectEqual(d6, d7.payload.pair.get1());
 
-    var d8 = try ctn.newData(.list);
-    const list = &d8.payload.list;
+    const list = try ctn.newList();
     try list.append(d7);
     try list.appendSlise(&.{ d6, d5, d4 });
     try std.testing.expectEqual(4, list.length());
@@ -67,11 +66,12 @@ fn testSave(df: *nyasdf.DataFormat, file: std.fs.File) !usize {
     const d0 = try df.newData(.byte);
     d0.payload.byte.set(0xFF);
 
-    const d1 = try df.newData(.bytes);
-    try d1.payload.bytes.set(&.{ 1, 2, 3, 4 });
+    try (try df.newBytes()).set(&.{ 1, 2, 3, 4 });
 
-    const d2 = try df.newData(.string);
-    try d2.payload.string.set("The quick brown fox jumps over the lazy dog");
+    const string = try df.newString();
+    try string.set("The quick brown fox jumps over the lazy dog");
+    const payload: *nyasdf.Data.Payload = @fieldParentPtr("string", string);
+    const d2: *nyasdf.Data = @fieldParentPtr("payload", payload);
 
     const d3 = try df.newData(.integer);
     try d3.payload.integer.set(@as(i34, 0x123456789));
@@ -120,36 +120,88 @@ test "load" {
     const df2: *const nyasdf.DataFormat = try .loadFromAlloc(file, gpa.allocator(), .{});
     defer { df2.deinit(); gpa.allocator().destroy(df2); }
 
-    const d0 = df2.datas.items[0];
-    try std.testing.expectEqual(0xFF, d0.payload.byte.get());
+    try std.testing.expectEqual(9, df2.countDatas());
 
-    const d1 = df2.datas.items[1];
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, d1.payload.bytes.get());
+    const d0 = df2.getData(0);
+    try std.testing.expectEqual(0xFF, d0.?.payload.byte.get());
 
-    const d2 = df2.datas.items[2];
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, df2.getData(1).?.payload.bytes.get());
+
+    const d2 = df2.getData(2).?;
     try std.testing.expectEqualStrings("The quick brown fox jumps over the lazy dog", d2.payload.string.get());
 
-    const d3 = df2.datas.items[3];
+    const d3 = df2.getData(3).?;
     try std.testing.expectEqual(@as(i34, 0x123456789), d3.payload.integer.get(i34));
 
-    const d4 = df2.datas.items[4];
+    const d4 = df2.getData(4).?;
     try std.testing.expectEqual(@as(i34, -0x123456789), d4.payload.integer.get(i34));
 
-    const d5 = df2.datas.items[5];
+    const d5 = df2.getData(5).?;
     try std.testing.expectEqual(@as(u32, @bitCast(std.math.nan(f32))), (@as(u32, @bitCast(d5.payload.f32.get()))));
 
-    const d6 = df2.datas.items[6];
+    const d6 = df2.getData(6).?;
     try std.testing.expectEqual(@as(u64, @bitCast(std.math.inf(f64))), (@as(u64, @bitCast(d6.payload.f64.get()))));
 
-    const pair = df2.datas.items[7].payload.pair;
+    const pair = df2.getData(7).?.payload.pair;
     try std.testing.expectEqual(d2, pair.get0());
     try std.testing.expectEqual(d4, pair.get1());
 
     const list = df2.datas.items[8].payload.list;
-    try std.testing.expectEqual(df2.datas.items[7], list.get(0));
+    try std.testing.expectEqual(df2.getData(7), list.get(0));
     try std.testing.expectEqual(d0, list.get(1));
     try std.testing.expectEqual(d3, list.get(2));
     try std.testing.expectEqual(d4, list.get(3));
     try std.testing.expectEqual(d5, list.get(4));
     try std.testing.expectEqual(d6, list.get(5));
+}
+
+test "reduce value data" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
+    defer _ = gpa.deinit();
+
+    var df: nyasdf.DataFormat = .init(gpa.allocator());
+    defer df.deinit();
+
+    const test1 = 0xFF;
+    const test2 = "a1b2c3";
+
+    const d0 = try df.newData(.byte);
+    d0.payload.byte.set(test1);
+
+    const d1 = try df.newData(.list);
+    try d1.payload.list.append(d0);
+
+    const d2 = try df.newData(.byte);
+    d2.payload.byte.set(test1);
+
+    const d3 = try df.newData(.string);
+    try d3.payload.string.set(test2);
+    try d1.payload.list.appendSlise(&.{ d3, d2 });
+
+    const d4 = try df.newData(.pair);
+    try d1.payload.list.append(d4);
+
+    const d5 = try df.newData(.string);
+    try d5.payload.string.set(test2);
+    try d4.payload.pair.set(d5, d0);
+
+    try std.testing.expectEqual(6, df.countDatas());
+    try df.reduce();
+    try std.testing.expectEqual(4, df.countDatas());
+
+    try std.testing.expect(df.containData(d0));
+    try std.testing.expect(df.containData(d1));
+    try std.testing.expect(!df.containData(d2));
+    try std.testing.expect(df.containData(d3));
+    try std.testing.expect(df.containData(d4));
+    try std.testing.expect(!df.containData(d5));
+
+    try std.testing.expectEqual(d3, d4.payload.pair.get0());
+    try std.testing.expectEqual(d0, d4.payload.pair.get1());
+
+    const expect_list = [_]*nyasdf.Data { d0, d3, d0, d4 };
+    try std.testing.expectEqual(expect_list.len, d1.payload.list.length());
+    for (expect_list, 0..) |data, index| {
+        try std.testing.expectEqual(data, d1.payload.list.get(index));
+    }
 }

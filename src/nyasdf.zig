@@ -31,18 +31,147 @@ pub const DataFormat = struct {
         new_data.* = .{
             .df = self,
             .index = self.datas.items.len - 1,
-            .payload = .init(@"type", self),
+            .payload = try .init(@"type", self),
         };
         return new_data;
+    }
+
+    pub fn newByte(self: *DataFormat) Allocator.Error!*Data.Payload.Byte {
+        const data = try self.newData(.byte);
+        return &data.payload.byte;
+    }
+    pub fn newBytes(self: *DataFormat) Allocator.Error!*Data.Payload.Bytes {
+        const data = try self.newData(.bytes);
+        return &data.payload.bytes;
+    }
+    pub fn newString(self: *DataFormat) Allocator.Error!*Data.Payload.String {
+        const data = try self.newData(.string);
+        return &data.payload.string;
+    }
+    pub fn newInteger(self: *DataFormat) Allocator.Error!*Data.Payload.Integer {
+        const data = try self.newData(.integer);
+        return &data.payload.integer;
+    }
+    pub fn newF32(self: *DataFormat) Allocator.Error!*Data.Payload.F32 {
+        const data = try self.newData(.f32);
+        return &data.payload.f32;
+    }
+    pub fn newF64(self: *DataFormat) Allocator.Error!*Data.Payload.F64 {
+        const data = try self.newData(.f64);
+        return &data.payload.f64;
+    }
+    pub fn newPair(self: *DataFormat) Allocator.Error!*Data.Payload.Pair {
+        const data = try self.newData(.pair);
+        return &data.payload.pair;
+    }
+    pub fn newList(self: *DataFormat) Allocator.Error!*Data.Payload.List {
+        const data = try self.newData(.list);
+        return &data.payload.list;
     }
 
     pub fn countDatas(self: DataFormat) usize {
         return self.datas.items.len;
     }
 
-    /// remove duplicate datas, data are not guarantee valid after this step.
+    /// useful for checking data validation after reducing
+    pub fn containData(self: DataFormat, data: *const Data) bool {
+        for (self.datas.items) |data2| {
+            if (data == data2) return true;
+        } else return false;
+    }
+
+    pub fn getData(self: DataFormat, index: usize) ?*Data {
+        if (index >= self.datas.items.len) return null;
+        return self.datas.items[index];
+    }
+
+    /// remove duplicate datas, data will be invalid after this step.
     pub fn reduce(self: *DataFormat) Allocator.Error!void {
-        _ = self;
+        const allocator = self.datas.allocator;
+
+        var ref_datas: std.ArrayList(*Data) = .init(allocator);
+        defer ref_datas.deinit();
+
+        const DataHashContext = struct {
+            pub fn hash(_: @This(), data: *const Data) u64 {
+                return Data.Payload.HashContext.hash(undefined, data.payload);
+            }
+            pub fn eql(_: @This(), data1: *const Data, data2: *const Data) bool {
+                return Data.Payload.HashContext.eql(undefined, data1.payload, data2.payload);
+            }
+        };
+        var uni_datas: std.HashMap(*const Data, void, DataHashContext, std.hash_map.default_max_load_percentage) = .init(allocator);
+        defer uni_datas.deinit();
+
+        var reduces: std.ArrayList(struct{ from: u64, to: u64 }) = .init(allocator);
+        defer reduces.deinit();
+
+        for (self.datas.items, 0..) |data, index| {
+            std.debug.assert(index == data.index);
+            if (data.payload.isRef()) {
+                try ref_datas.append(data);
+                continue;
+            }
+            if (uni_datas.getEntry(data)) |repeated| {
+                try reduces.append(.{ .from = data.index, .to = repeated.key_ptr.*.index});
+            }
+            else {
+                try uni_datas.put(data, undefined);
+            }
+        }
+        uni_datas.clearRetainingCapacity();
+
+        const tryReplaceRepeated = struct {
+            fn foo(replace_pairs: @TypeOf(reduces), index: *u64) void {
+                // note the field `from` in `replaces` is well ordered
+                for (replace_pairs.items) |pair| {
+                    if (pair.from == index.*) {
+                        index.* = pair.to;
+                        return;
+                    } else if (pair.from > index.*) return;
+                }
+            }
+        }.foo;
+        for (ref_datas.items) |data| {
+            switch (data.payload) {
+                .pair => |*pair| {
+                    tryReplaceRepeated(reduces, &pair.@"0");
+                    tryReplaceRepeated(reduces, &pair.@"1");
+                },
+                .list => |list| {
+                    for (list.indicies.items) |*index| tryReplaceRepeated(reduces, index);
+                },
+                else => unreachable,
+            }
+        }
+
+        const index_remaps = try allocator.alloc(usize, self.datas.items.len);
+        defer allocator.free(index_remaps);
+        {
+            var index = reduces.items.len;
+            while (index > 0) {
+                index -= 1;
+                const trash = self.datas.swapRemove(reduces.items[index].from);
+                trash.payload.deinit();
+                allocator.destroy(trash);
+            }
+        }
+        for (self.datas.items, 0..) |data, new_index| {
+            index_remaps[data.index] = new_index;
+            data.index = new_index;
+        }
+        for (ref_datas.items) |data| {
+            switch (data.payload) {
+                .pair => |*pair| {
+                    pair.@"0" = index_remaps[pair.@"0"];
+                    pair.@"1" = index_remaps[pair.@"1"];
+                },
+                .list => |list| {
+                    for (list.indicies.items) |*index| index.* = index_remaps[index.*];
+                },
+                else => unreachable,
+            }
+        }
     }
 
     pub const SaveError = Allocator.Error || File.GetSeekPosError || File.WriteError;
@@ -131,7 +260,9 @@ pub const DataFormat = struct {
 };
 
 pub const Data = struct {
+    /// should not change this
     df: *const DataFormat,
+    /// should not change this
     index: u64,
     payload: Payload,
 
@@ -156,11 +287,15 @@ pub const Data = struct {
         pair: Pair,
         list: List,
 
-        fn init(@"type": Data.Type, df: *const DataFormat) Data.Payload {
+        pub fn isRef(self: Data.Payload) bool {
+            return self == .pair or self == .list;
+        }
+
+        fn init(@"type": Data.Type, df: *const DataFormat) Allocator.Error!Data.Payload {
             return switch (@"type") { // TODO: use @typeInfo and inline for
                 .byte    => .{ .byte    = .init(df) },
                 .bytes   => .{ .bytes   = .init(df) },
-                .string  => .{ .string  = .init(df) },
+                .string  => .{ .string  = try .init(df) },
                 .integer => .{ .integer = .init(df) },
                 .f32     => .{ .f32     = .init(df) },
                 .f64     => .{ .f64     = .init(df) },
@@ -170,19 +305,39 @@ pub const Data = struct {
         }
 
         fn deinit(self: Data.Payload) void {
-            switch (self) { // TODO: use @typeInfo and inline for
-                .byte    => |payload| payload.deinit(),
-                .bytes   => |payload| payload.deinit(),
-                .string  => |payload| payload.deinit(),
-                .integer => |payload| payload.deinit(),
-                .f32     => |payload| payload.deinit(),
-                .f64     => |payload| payload.deinit(),
-                .pair    => |payload| payload.deinit(),
-                .list    => |payload| payload.deinit(),
-            }
+            const tag = std.meta.activeTag(self);
+            inline for (std.meta.fields(Data.Payload)) |field| {
+                if (@field(Data.Type, field.name) == tag) {
+                    @field(self, field.name).deinit();
+                    return;
+                }
+            } else unreachable;
         }
 
-        fn writeInto(self: Data.Payload, file: File) File.WriteError!usize {
+        pub const HashContext = struct {
+            pub fn hash(_: Payload.HashContext, payload: Data.Payload) u64 {
+                const tag = std.meta.activeTag(payload);
+                inline for (std.meta.fields(Data.Payload)) |field| {
+                    if (@field(Data.Type, field.name) == tag) {
+                        const pl = @field(payload, field.name);
+                        return @TypeOf(pl).HashContext.hash(undefined, pl);
+                    }
+                } else unreachable;
+            }
+
+            pub fn eql(_: Payload.HashContext, payload1: Data.Payload, payload2: Data.Payload) bool {
+                const tag = std.meta.activeTag(payload1);
+                if (tag != payload2) return false;
+                inline for (std.meta.fields(Data.Payload)) |field| {
+                    if (@field(Data.Type, field.name) == tag) {
+                        const pl = @field(payload1, field.name);
+                        return @TypeOf(pl).HashContext.eql(undefined, pl, @field(payload2, field.name));
+                    }
+                } else unreachable;
+            }
+        };
+
+        pub fn writeInto(self: Data.Payload, file: File) File.WriteError!usize {
             const tag: u8 = @intFromEnum(self);
             try file.writeAll((&tag)[0..1]);
 
@@ -200,7 +355,7 @@ pub const Data = struct {
 
         pub const ReadError = error { GetInvalidDataType } || File.ReadError || Allocator.Error;
 
-        fn readFrom(file: File, df: *const DataFormat) ReadError!Payload {
+        pub fn readFrom(file: File, df: *const DataFormat) ReadError!Data.Payload {
             var type_num: u8 = 0xFF;
             _ = try file.readAll((&type_num)[0..1]);
             const @"type" = std.enums.fromInt(Data.Type, type_num) orelse return ReadError.GetInvalidDataType;
@@ -218,6 +373,7 @@ pub const Data = struct {
         }
 
         pub const Byte = struct {
+            /// should not change this
             df: *const DataFormat,
             byte: u8,
 
@@ -232,12 +388,22 @@ pub const Data = struct {
                 _ = self;
             }
 
-            fn writeInto(self: Byte, file: File) File.WriteError!usize {
+            pub const HashContext = struct {
+                pub fn hash(_: Byte.HashContext, byte: Byte) u64 {
+                    return byte.byte;
+                }
+
+                pub fn eql(_: Byte.HashContext, byte1: Byte, byte2: Byte) bool {
+                    return byte1.byte == byte2.byte;
+                }
+            };
+
+            pub fn writeInto(self: Byte, file: File) File.WriteError!usize {
                 try file.writeAll((&self.byte)[0..1]);
                 return 1;
             }
 
-            fn readFrom(file: File, df: *const DataFormat) File.ReadError!Byte {
+            pub fn readFrom(file: File, df: *const DataFormat) File.ReadError!Byte {
                 var self: Byte = .init(df);
                 errdefer self.deinit();
                 _ = try file.readAll((&self.byte)[0..1]);
@@ -255,6 +421,7 @@ pub const Data = struct {
 
         /// always assume bytes are little endian
         pub const Bytes = struct {
+            /// should not change this
             df: *const DataFormat,
             bytes: []u8,
 
@@ -269,28 +436,41 @@ pub const Data = struct {
                 self.df.datas.allocator.free(self.bytes);
             }
 
-            fn writeInto(self: Bytes, file: File) File.WriteError!usize {
+            pub const HashContext = struct {
+                pub fn hash(_: Bytes.HashContext, bytes: Bytes) u64 {
+                    return std.hash.Wyhash.hash(0, bytes.bytes);
+                }
+
+                pub fn eql(_: Bytes.HashContext, bytes1: Bytes, bytes2: Bytes) bool {
+                    return std.mem.eql(u8, bytes1.bytes, bytes2.bytes);
+                }
+            };
+
+            pub fn writeInto(self: Bytes, file: File) File.WriteError!usize {
                 const len_len = try writeVarInt(file, self.bytes.len);
                 try file.writeAll(self.bytes);
                 return len_len + self.bytes.len;
             }
 
-            fn readFrom(file: File, df: *const DataFormat) (File.ReadError || Allocator.Error)!Bytes {
-                var self: Bytes = .init(df);
-                errdefer self.deinit();
-
+            pub fn readFrom(file: File, df: *const DataFormat) (File.ReadError || Allocator.Error)!Bytes {
                 const len = try readVarInt(file, u64);
-                self.bytes = try df.datas.allocator.alloc(u8, len);
-                _ = try file.readAll(self.bytes);
-
-                return self;
+                const bytes = try df.datas.allocator.alloc(u8, len);
+                errdefer df.datas.allocator.free(bytes);
+                _ = try file.readAll(bytes);
+                return .{ .df = df, .bytes = bytes };
             }
 
             pub fn set(self: *Bytes, val: []const u8) Allocator.Error!void {
                 const allocator = self.df.datas.allocator;
-                allocator.free(self.bytes);
-                errdefer self.bytes = &.{};
-                self.bytes = try allocator.dupe(u8, val);
+                if (allocator.resize(self.bytes, val.len)) {
+                    self.bytes.len = val.len;
+                    @memcpy(self.bytes, val);
+                }
+                else {
+                    allocator.free(self.bytes);
+                    self.bytes.len = 0;
+                    self.bytes = try allocator.dupe(u8, val);
+                }
             }
 
             pub fn get(self: @This()) []u8 {
@@ -299,64 +479,72 @@ pub const Data = struct {
         };
 
         pub const String = struct {
+            /// should not change this
             df: *const DataFormat,
-            string: [:0]const u8,
+            string: [:0]u8,
 
-            fn init(df: *const DataFormat) String {
+            fn init(df: *const DataFormat) Allocator.Error!String {
                 return .{
                     .df = df,
-                    .string = empty_string,
+                    .string = try df.datas.allocator.allocSentinel(u8, 0, 0),
                 };
             }
 
             fn deinit(self: String) void {
-                self.freeString();
+                self.df.datas.allocator.free(self.string);
             }
 
-            fn writeInto(self: String, file: File) File.WriteError!usize {
+            pub const HashContext = struct {
+                pub fn hash(_: String.HashContext, string: String) u64 {
+                    return std.hash.Wyhash.hash(0, string.string);
+                }
+
+                pub fn eql(_: String.HashContext, string1: String, string2: String) bool {
+                    return std.mem.orderZ(u8, string1.string, string2.string) == .eq;
+                }
+            };
+
+            pub fn writeInto(self: String, file: File) File.WriteError!usize {
                 const len_len = try writeVarInt(file, self.string.len);
                 try file.writeAll(self.string);
                 return len_len + self.string.len;
             }
 
-            fn readFrom(file: File, df: *const DataFormat) (File.ReadError || Allocator.Error)!String {
-                var self: String = .init(df);
-                errdefer self.deinit();
-
+            pub fn readFrom(file: File, df: *const DataFormat) (File.ReadError || Allocator.Error)!String {
                 const len = try readVarInt(file, u64);
                 const string = try df.datas.allocator.allocSentinel(u8, len, 0);
                 errdefer df.datas.allocator.free(string);
                 _ = try file.readAll(string);
-
-                self.string = string;
-                return self;
+                return .{ .df = df, .string = string };
             }
 
             pub fn set(self: *String, val: [:0]const u8) Allocator.Error!void {
                 const allocator = self.df.datas.allocator;
-                self.freeString();
-                errdefer self.string = empty_string;
-                self.string = try allocator.dupeZ(u8, val);
-            }
-
-            pub fn get(self: String) [:0]const u8 {
-                return self.string;
-            }
-
-            const empty_string = "";
-
-            fn freeString(self: String) void {
-                const allocator = self.df.datas.allocator;
-                if (self.string.ptr != empty_string) {
-                    allocator.free(self.string[0..self.string.len + 1]);
+                const bytes = self.string[0..self.string.len + 1];
+                if (allocator.resize(bytes, val.len + 1)) {
+                    bytes[val.len] = 0;
+                    self.string.len = val.len;
+                    @memcpy(self.string, val);
                 }
+                else {
+                    allocator.free(self.string);
+                    self.string = try allocator.dupeZ(u8, val);
+                }
+            }
+
+            pub fn get(self: String) [:0]u8 {
+                return self.string;
             }
         };
 
         pub const Integer = struct {
+            /// should not change this
             df: *const DataFormat,
-            data: [*]const u8,
+            /// should not change this
+            data: [*]u8,
+            /// should not change this
             is_negative: bool,
+            /// should not change this
             abs_bits: u16,
 
             fn init(df: *const DataFormat) Integer {
@@ -369,10 +557,24 @@ pub const Data = struct {
             }
 
             fn deinit(self: Integer) void {
-                self.freeData();
+                self.df.datas.allocator.free(self.data[0..self.dataLength()]);
             }
 
-            fn writeInto(self: Integer, file: File) File.WriteError!usize {
+            pub const HashContext = struct {
+                pub fn hash(_: Integer.HashContext, int: Integer) u64 {
+                    var hasher = std.hash.Wyhash.init(@intFromBool(int.is_negative));
+                    hasher.update(int.data[0..int.dataLength()]);
+                    return hasher.final();
+                }
+
+                pub fn eql(_: Integer.HashContext, int1: Integer, int2: Integer) bool {
+                    const data_len = int1.dataLength();
+                    return int1.is_negative == int2.is_negative and int1.abs_bits == int2.abs_bits
+                        and std.mem.eql(u8, int1.data[0..data_len], int2.data[0..data_len]);
+                }
+            };
+
+            pub fn writeInto(self: Integer, file: File) File.WriteError!usize {
                 const data_len = self.dataLength();
                 const header = (@as(u15, data_len) << 1) | @intFromBool(self.is_negative);
                 const header_len = try writeVarInt(file, header);
@@ -380,7 +582,7 @@ pub const Data = struct {
                 return @as(usize, header_len) + data_len;
             }
 
-            fn readFrom(file: File, df: *const DataFormat) (File.ReadError || Allocator.Error)!Integer {
+            pub fn readFrom(file: File, df: *const DataFormat) (File.ReadError || Allocator.Error)!Integer {
                 var self: Integer = .init(df);
                 errdefer self.deinit();
 
@@ -407,27 +609,39 @@ pub const Data = struct {
                 const info = @typeInfo(@TypeOf(val));
                 if (info != .int) @compileError(@typeName(Integer) ++ ".set only accepts integers");
                 const UInt = std.meta.Int(.unsigned, info.int.bits);
-                // `-2^(n-1)` for n-bit signed integer will cause numerical error, -2^65535 in i65535 will cause memory leaks
-                if (info.int.signedness == .signed) std.debug.assert(val > std.math.minInt(@TypeOf(val)));
+                // `-2^(n-1)` for n-bit signed integer may cause numerical error, see `.minFitableBits`
+                if (info.int.signedness == .signed) std.debug.assert(val != std.math.minInt(@TypeOf(val)));
+                const MaxSInt = std.meta.Int(.signed, std.math.maxInt(u16));
 
-                self.freeData();
-                errdefer self.* = .init(self.df);
-
+                const allocator = self.df.datas.allocator;
+                var data: []u8 = self.data[0..self.dataLength()];
                 if (val == 0) {
-                    self.* = .init(self.df);
+                    allocator.free(data);
+                    self.data = empty_data;
+                    self.abs_bits = 0;
                     return;
                 }
-                const neg = val < 0; // this can determite at comptime if val is a uint
+
+                const neg = if (@TypeOf(val) == MaxSInt)
+                    val < 0 and val != std.math.minInt(MaxSInt) // see `.minFitableBits`
+                else
+                    val < 0 // this can determite at comptime if val is a uint
+                ;
                 self.is_negative = neg;
                 var uint: UInt = @bitCast(val);
-                if (neg) uint = (~uint) + 1; // manually perform negative operation to work around uint
-                self.abs_bits = info.int.bits - @clz(uint);
+                if (neg) uint = -%uint;
+                const bits = info.int.bits - @clz(uint);
                 if (big_endian) uint = @byteSwap(uint);
-
-                const data_len = self.dataLength();
-                const data = try self.df.datas.allocator.alloc(u8, data_len);
-                errdefer self.df.datas.allocator.free(data);
                 const bytes: [*]const u8 = @ptrCast(&uint);
+
+                const data_len: u14 = @truncate((bits / 8) + @intFromBool(bits % 8 != 0));
+                if (!allocator.resize(data, data_len)) {
+                    allocator.free(data);
+                    self.abs_bits = 0;
+                    data = try allocator.alloc(u8, data_len);
+                    self.data = data.ptr;
+                }
+                self.abs_bits = bits;
                 @memcpy(data, bytes);
 
                 const extra_bits: u3 = @truncate(self.abs_bits % 8);
@@ -435,7 +649,6 @@ pub const Data = struct {
                     const data_mask = (@as(u8, 1) << extra_bits) - 1;
                     data[data_len - 1] &= data_mask;
                 }
-                self.data = data.ptr;
             }
 
             /// truncate if the bit size of `Int` is less than `.minFitableBits()`,
@@ -452,29 +665,26 @@ pub const Data = struct {
 
                 const int: *Int = @ptrCast(@alignCast(&int_buffer));
                 if (big_endian) int.* = @byteSwap(int.*);
-                if (self.is_negative) int.* = (~(int.*)) + 1; // manually perform negative operation to work around uint
+                if (self.is_negative) int.* = -%int.*;
 
                 return int.*;
             }
 
             pub fn minFitableBits(self: Integer) u16 {
                 if (self.abs_bits == 0) return 0;
-                // ? check for -2^n
+                // ? check for `-2^n`, `-2^n` can fit into n-bit instead of (n+1)-bit integer.
                 return std.math.add(u16, self.abs_bits, @intFromBool(self.is_negative)) catch unreachable;
             }
 
-            const empty_data: [*]const u8 = @ptrFromInt(std.math.maxInt(usize));
+            const empty_data: [*]u8 = @ptrFromInt(std.math.maxInt(usize));
 
             fn dataLength(self: Integer) u14 {
                 return @truncate((self.abs_bits / 8) + @intFromBool(self.abs_bits % 8 != 0));
             }
-
-            fn freeData(self: Integer) void {
-                self.df.datas.allocator.free(self.data[0..self.dataLength()]);
-            }
         };
 
         pub const F32 = struct {
+            /// should not change this
             df: *const DataFormat,
             le_f32: f32,
 
@@ -489,13 +699,23 @@ pub const Data = struct {
                 _ = self;
             }
 
-            fn writeInto(self: F32, file: File) File.WriteError!usize {
+            pub const HashContext = struct {
+                pub fn hash(_: F32.HashContext, f: F32) u64 {
+                    return std.hash.int(@as(u32, @bitCast(f.le_f32)));
+                }
+
+                pub fn eql(_: F32.HashContext, f1: F32, f2: F32) bool {
+                    return @as(u32, @bitCast(f1.le_f32)) == @as(u32, @bitCast(f2.le_f32));
+                }
+            };
+
+            pub fn writeInto(self: F32, file: File) File.WriteError!usize {
                 const bit: [@sizeOf(f32)]u8 = @bitCast(self.le_f32);
                 try file.writeAll(&bit);
                 return @sizeOf(f32);
             }
 
-            fn readFrom(file: File, df: *const DataFormat) File.ReadError!F32 {
+            pub fn readFrom(file: File, df: *const DataFormat) File.ReadError!F32 {
                 var self: F32 = .init(df);
                 errdefer self.deinit();
                 const ptr: [*]u8 = @ptrCast(&self.le_f32);
@@ -527,6 +747,7 @@ pub const Data = struct {
         };
 
         pub const F64 = struct {
+            /// should not change this
             df: *const DataFormat,
             le_f64: f64,
 
@@ -541,13 +762,23 @@ pub const Data = struct {
                 _ = self;
             }
 
-            fn writeInto(self: F64, file: File) File.WriteError!usize {
+            pub const HashContext = struct {
+                pub fn hash(_: F64.HashContext, f: F64) u64 {
+                    return std.hash.int(@as(u64, @bitCast(f.le_f64)));
+                }
+
+                pub fn eql(_: F64.HashContext, f1: F64, f2: F64) bool {
+                    return @as(u64, @bitCast(f1.le_f64)) == @as(u64, @bitCast(f2.le_f64));
+                }
+            };
+
+            pub fn writeInto(self: F64, file: File) File.WriteError!usize {
                 const bit: [@sizeOf(f64)]u8 = @bitCast(self.le_f64);
                 try file.writeAll(&bit);
                 return @sizeOf(f64);
             }
 
-            fn readFrom(file: File, df: *const DataFormat) File.ReadError!F64 {
+            pub fn readFrom(file: File, df: *const DataFormat) File.ReadError!F64 {
                 var self: F64 = .init(df);
                 errdefer self.deinit();
                 const ptr: [*]u8 = @ptrCast(&self.le_f64);
@@ -579,6 +810,7 @@ pub const Data = struct {
         };
 
         pub const Pair = struct {
+            /// should not change this
             df: *const DataFormat,
             @"0": u64,
             @"1": u64,
@@ -595,11 +827,24 @@ pub const Data = struct {
                 _ = self;
             }
 
-            fn writeInto(self: Pair, file: File) File.WriteError!usize {
+            pub const HashContext = struct {
+                pub fn hash(_: Pair.HashContext, pair: Pair) u64 {
+                    var hasher = std.hash.Wyhash.init(0);
+                    hasher.update(std.mem.asBytes(&pair.@"0"));
+                    hasher.update(std.mem.asBytes(&pair.@"1"));
+                    return hasher.final();
+                }
+
+                pub fn eql(_: Pair.HashContext, pair1: Pair, pair2: Pair) bool {
+                    return pair1.@"0" == pair2.@"0" and pair1.@"1" == pair2.@"1";
+                }
+            };
+
+            pub fn writeInto(self: Pair, file: File) File.WriteError!usize {
                 return try writeVarInt(file, self.@"0") + try writeVarInt(file, self.@"1");
             }
 
-            fn readFrom(file: File, df: *const DataFormat) File.ReadError!Pair {
+            pub fn readFrom(file: File, df: *const DataFormat) File.ReadError!Pair {
                 var self: Pair = .init(df);
                 errdefer self.deinit();
                 self.@"0" = try readVarInt(file, u64);
@@ -635,6 +880,7 @@ pub const Data = struct {
         };
 
         pub const List = struct {
+            /// should not change this
             df: *const DataFormat,
             indicies: std.ArrayList(u64),
 
@@ -649,13 +895,25 @@ pub const Data = struct {
                 self.indicies.deinit();
             }
 
-            fn writeInto(self: List, file: File) File.WriteError!usize {
+            pub const HashContext = struct {
+                pub fn hash(_: List.HashContext, list: List) u64 {
+                    var hasher = std.hash.Wyhash.init(0);
+                    for (list.indicies.items) |index| hasher.update(std.mem.asBytes(&index));
+                    return hasher.final();
+                }
+
+                pub fn eql(_: List.HashContext, list1: List, list2: List) bool {
+                    return std.mem.eql(u64, list1.indicies.items, list2.indicies.items);
+                }
+            };
+
+            pub fn writeInto(self: List, file: File) File.WriteError!usize {
                 var count = try writeVarInt(file, self.indicies.items.len);
                 for (self.indicies.items) |index| count += try writeVarInt(file, index);
                 return count;
             }
 
-            fn readFrom(file: File, df: *const DataFormat) (File.ReadError || Allocator.Error)!List {
+            pub fn readFrom(file: File, df: *const DataFormat) (File.ReadError || Allocator.Error)!List {
                 var self: List = .init(df);
                 errdefer self.deinit();
 

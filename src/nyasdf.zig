@@ -23,7 +23,7 @@ pub const DataFormat = struct {
         self.datas.deinit();
     }
 
-    pub fn newData(self: *DataFormat, @"type": Data.Type) Allocator.Error!*Data {
+    pub fn new(self: *DataFormat, @"type": Data.Type) Allocator.Error!*Data {
         const new_data = try self.datas.allocator.create(Data);
         errdefer self.datas.allocator.destroy(new_data);
         try self.datas.append(new_data);
@@ -37,44 +37,44 @@ pub const DataFormat = struct {
     }
 
     pub fn newByte(self: *DataFormat) Allocator.Error!*Data.Payload.Byte {
-        const data = try self.newData(.byte);
+        const data = try self.new(.byte);
         return &data.payload.byte;
     }
     pub fn newBytes(self: *DataFormat) Allocator.Error!*Data.Payload.Bytes {
-        const data = try self.newData(.bytes);
+        const data = try self.new(.bytes);
         return &data.payload.bytes;
     }
     pub fn newString(self: *DataFormat) Allocator.Error!*Data.Payload.String {
-        const data = try self.newData(.string);
+        const data = try self.new(.string);
         return &data.payload.string;
     }
     pub fn newInteger(self: *DataFormat) Allocator.Error!*Data.Payload.Integer {
-        const data = try self.newData(.integer);
+        const data = try self.new(.integer);
         return &data.payload.integer;
     }
     pub fn newF32(self: *DataFormat) Allocator.Error!*Data.Payload.F32 {
-        const data = try self.newData(.f32);
+        const data = try self.new(.f32);
         return &data.payload.f32;
     }
     pub fn newF64(self: *DataFormat) Allocator.Error!*Data.Payload.F64 {
-        const data = try self.newData(.f64);
+        const data = try self.new(.f64);
         return &data.payload.f64;
     }
     pub fn newPair(self: *DataFormat) Allocator.Error!*Data.Payload.Pair {
-        const data = try self.newData(.pair);
+        const data = try self.new(.pair);
         return &data.payload.pair;
     }
     pub fn newList(self: *DataFormat) Allocator.Error!*Data.Payload.List {
-        const data = try self.newData(.list);
+        const data = try self.new(.list);
         return &data.payload.list;
     }
 
-    pub fn countDatas(self: DataFormat) usize {
+    pub fn length(self: DataFormat) usize {
         return self.datas.items.len;
     }
 
     /// useful for checking data validation after reducing
-    pub fn containData(self: DataFormat, data: *const Data) bool {
+    pub fn contain(self: DataFormat, data: *const Data) bool {
         for (self.datas.items) |data2| {
             if (data == data2) return true;
         } else return false;
@@ -85,9 +85,12 @@ pub const DataFormat = struct {
         return self.datas.items[index];
     }
 
-    /// remove duplicate datas, data will be invalid after this step.
+    /// remove repeated datas, data may be invalid after this step.
     pub fn reduce(self: *DataFormat) Allocator.Error!void {
         const allocator = self.datas.allocator;
+
+        const index_remaps = try allocator.alloc(usize, self.datas.items.len);
+        defer allocator.free(index_remaps);
 
         var ref_datas: std.ArrayList(*Data) = .init(allocator);
         defer ref_datas.deinit();
@@ -103,9 +106,11 @@ pub const DataFormat = struct {
         var uni_datas: std.HashMap(*const Data, void, DataHashContext, std.hash_map.default_max_load_percentage) = .init(allocator);
         defer uni_datas.deinit();
 
+        // reduce rules
         var reduces: std.ArrayList(struct{ from: u64, to: u64 }) = .init(allocator);
         defer reduces.deinit();
 
+        // find ref datas and repeated value datas
         for (self.datas.items, 0..) |data, index| {
             std.debug.assert(index == data.index);
             if (data.payload.isRef()) {
@@ -119,35 +124,34 @@ pub const DataFormat = struct {
                 try uni_datas.put(data, undefined);
             }
         }
-        uni_datas.clearRetainingCapacity();
 
-        const tryReplaceRepeated = struct {
-            fn foo(replace_pairs: @TypeOf(reduces), index: *u64) void {
+        // apply reduce rules to all ref datas
+        const applyReduces = struct {
+            fn foo(reduce_pairs: @TypeOf(reduces), index: *u64) void {
                 // note the field `from` in `replaces` is well ordered
-                for (replace_pairs.items) |pair| {
+                for (reduce_pairs.items) |pair| {
                     if (pair.from == index.*) {
                         index.* = pair.to;
                         return;
-                    } else if (pair.from > index.*) return;
+                    }
+                    if (pair.from > index.*) return;
                 }
             }
         }.foo;
         for (ref_datas.items) |data| {
             switch (data.payload) {
                 .pair => |*pair| {
-                    tryReplaceRepeated(reduces, &pair.@"0");
-                    tryReplaceRepeated(reduces, &pair.@"1");
+                    applyReduces(reduces, &pair.@"0");
+                    applyReduces(reduces, &pair.@"1");
                 },
                 .list => |list| {
-                    for (list.indicies.items) |*index| tryReplaceRepeated(reduces, index);
+                    for (list.indicies.items) |*index| applyReduces(reduces, index);
                 },
                 else => unreachable,
             }
         }
 
-        const index_remaps = try allocator.alloc(usize, self.datas.items.len);
-        defer allocator.free(index_remaps);
-        {
+        { // remove all repeated value datas
             var index = reduces.items.len;
             while (index > 0) {
                 index -= 1;
@@ -156,6 +160,7 @@ pub const DataFormat = struct {
                 allocator.destroy(trash);
             }
         }
+        // re-indexing
         for (self.datas.items, 0..) |data, new_index| {
             index_remaps[data.index] = new_index;
             data.index = new_index;
@@ -170,6 +175,69 @@ pub const DataFormat = struct {
                     for (list.indicies.items) |*index| index.* = index_remaps[index.*];
                 },
                 else => unreachable,
+            }
+        }
+
+        while (true) { // remove all repeated ref datas, similar to remove value datas above
+            const sortData = struct {
+                fn foo(_: void, data1: *const Data, data2: *const Data) bool {
+                    return data1.index < data2.index;
+                }
+            }.foo;
+            std.mem.sortUnstable(*Data, ref_datas.items, void{}, sortData);
+            uni_datas.clearRetainingCapacity();
+            reduces.clearRetainingCapacity();
+
+            for (ref_datas.items, 0..) |data, ref_index| {
+                index_remaps[data.index] = ref_index;
+                if (uni_datas.getEntry(data)) |repeated| {
+                    try reduces.append(.{ .from = data.index, .to = repeated.key_ptr.*.index});
+                }
+                else {
+                    try uni_datas.put(data, undefined);
+                }
+            }
+            if (reduces.items.len == 0) return;
+
+            for (ref_datas.items) |data| {
+                switch (data.payload) {
+                    .pair => |*pair| {
+                        applyReduces(reduces, &pair.@"0");
+                        applyReduces(reduces, &pair.@"1");
+                    },
+                    .list => |list| {
+                        for (list.indicies.items) |*index| applyReduces(reduces, index);
+                    },
+                    else => unreachable,
+                }
+            }
+
+            {
+                var index = reduces.items.len;
+                while (index > 0) {
+                    index -= 1;
+                    const trash = self.datas.swapRemove(reduces.items[index].from);
+                    const ref_index = index_remaps[trash.index];
+                    trash.payload.deinit();
+                    allocator.destroy(trash);
+                    _ = ref_datas.swapRemove(ref_index);
+                }
+            }
+            for (self.datas.items, 0..) |data, new_index| {
+                index_remaps[data.index] = new_index;
+                data.index = new_index;
+            }
+            for (ref_datas.items) |data| {
+                switch (data.payload) {
+                    .pair => |*pair| {
+                        pair.@"0" = index_remaps[pair.@"0"];
+                        pair.@"1" = index_remaps[pair.@"1"];
+                    },
+                    .list => |list| {
+                        for (list.indicies.items) |*index| index.* = index_remaps[index.*];
+                    },
+                    else => unreachable,
+                }
             }
         }
     }
@@ -267,14 +335,20 @@ pub const Data = struct {
     payload: Payload,
 
     pub const Type = enum(u8) {
-        byte,
+        // value types
+        byte = 0,
         bytes,
         string,
         integer,
         f32,
         f64,
-        pair,
+        // ref types
+        pair = 0x80,
         list,
+
+        pub fn isRef(self: Data.Type) bool {
+            return @intFromEnum(self) & 0x80 != 0;
+        }
     };
 
     pub const Payload = union(Type) {
@@ -288,7 +362,7 @@ pub const Data = struct {
         list: List,
 
         pub fn isRef(self: Data.Payload) bool {
-            return self == .pair or self == .list;
+            return @as(Data.Type, self).isRef();
         }
 
         fn init(@"type": Data.Type, df: *const DataFormat) Allocator.Error!Data.Payload {
@@ -867,15 +941,30 @@ pub const Data = struct {
                 try self.set1(@"1");
             }
 
-            pub fn get0(self: Pair) ?*Data {
+            pub fn tryGet0(self: Pair) ?*Data {
                 const datas = self.df.datas;
                 if (self.@"0" >= datas.items.len) return null;
                 return datas.items[self.@"0"];
             }
-            pub fn get1(self: Pair) ?*Data {
+            pub fn tryGet1(self: Pair) ?*Data {
                 const datas = self.df.datas;
                 if (self.@"1" >= datas.items.len) return null;
                 return datas.items[self.@"1"];
+            }
+            pub fn tryGet(self: Pair) struct{?*Data, ?*Data} {
+                return .{self.tryGet0(), self.tryGet1()};
+            }
+
+            pub fn get0(self: Pair) *Data {
+                const datas = self.df.datas;
+                return datas.items[self.@"0"];
+            }
+            pub fn get1(self: Pair) *Data {
+                const datas = self.df.datas;
+                return datas.items[self.@"1"];
+            }
+            pub fn get(self: Pair) struct{*Data, *Data} {
+                return .{self.get0(), self.get1()};
             }
         };
 
@@ -955,12 +1044,34 @@ pub const Data = struct {
                 return datas.items[index];
             }
 
-            pub fn get(self: List, index: usize) ?*Data {
+            pub fn get(self: List, index: usize) *Data {
+                const k = self.indicies.items[index];
+                return self.df.datas.items[k];
+            }
+
+            pub fn tryGet(self: List, index: usize) ?*Data {
                 const datas = self.df.datas;
                 if (index >= self.indicies.items.len) return null;
                 const k = self.indicies.items[index];
                 if (k >= datas.items.len) return null;
                 return datas.items[k];
+            }
+
+            pub const Iterator = struct {
+                list: *const List,
+                index: usize = 0,
+
+                pub fn next(self: *List.Iterator) ?*Data {
+                    const datas = self.list.df.datas.items;
+                    if (self.index >= self.list.length()) return null;
+                    const k = self.list.indicies.items[self.index];
+                    self.index += 1;
+                    return datas[k];
+                }
+            };
+
+            pub fn iter(self: *const List) List.Iterator {
+                return .{ .list = self };
             }
         };
     };

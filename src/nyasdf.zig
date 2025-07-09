@@ -2,346 +2,38 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const File = std.fs.File;
-const big_endian = builtin.cpu.arch.endian() == .big;
+const assert = std.debug.assert;
+
+/// used to indicate the entry of nyasdf (nyas Data Format)
+pub const entry_label = "nyasdf";
 
 
-pub const DataFormat = struct {
-    datas: std.ArrayList(*Data),
-
-    pub const entry_lable = "nyasdf";
-
-    pub fn init(allocator: Allocator) DataFormat {
-        return .{ .datas = .init(allocator) };
-    }
-
-    pub fn deinit(self: DataFormat) void {
-        for (self.datas.items) |data| {
-            data.payload.deinit();
-            self.datas.allocator.destroy(data);
-        }
-        self.datas.deinit();
-    }
-
-    pub fn new(self: *DataFormat, @"type": Data.Type) Allocator.Error!*Data {
-        const new_data = try self.datas.allocator.create(Data);
-        errdefer self.datas.allocator.destroy(new_data);
-        try self.datas.append(new_data);
-
-        new_data.* = .{
-            .df = self,
-            .index = self.datas.items.len - 1,
-            .payload = try .init(@"type", self),
-        };
-        return new_data;
-    }
-
-    pub fn newByte(self: *DataFormat) Allocator.Error!*Data.Payload.Byte {
-        const data = try self.new(.byte);
-        return &data.payload.byte;
-    }
-    pub fn newBytes(self: *DataFormat) Allocator.Error!*Data.Payload.Bytes {
-        const data = try self.new(.bytes);
-        return &data.payload.bytes;
-    }
-    pub fn newString(self: *DataFormat) Allocator.Error!*Data.Payload.String {
-        const data = try self.new(.string);
-        return &data.payload.string;
-    }
-    pub fn newInteger(self: *DataFormat) Allocator.Error!*Data.Payload.Integer {
-        const data = try self.new(.integer);
-        return &data.payload.integer;
-    }
-    pub fn newF32(self: *DataFormat) Allocator.Error!*Data.Payload.F32 {
-        const data = try self.new(.f32);
-        return &data.payload.f32;
-    }
-    pub fn newF64(self: *DataFormat) Allocator.Error!*Data.Payload.F64 {
-        const data = try self.new(.f64);
-        return &data.payload.f64;
-    }
-    pub fn newPair(self: *DataFormat) Allocator.Error!*Data.Payload.Pair {
-        const data = try self.new(.pair);
-        return &data.payload.pair;
-    }
-    pub fn newList(self: *DataFormat) Allocator.Error!*Data.Payload.List {
-        const data = try self.new(.list);
-        return &data.payload.list;
-    }
-
-    pub fn length(self: DataFormat) usize {
-        return self.datas.items.len;
-    }
-
-    /// useful for checking data validation after reducing
-    pub fn contain(self: DataFormat, data: *const Data) bool {
-        for (self.datas.items) |data2| {
-            if (data == data2) return true;
-        } else return false;
-    }
-
-    pub fn getData(self: DataFormat, index: usize) ?*Data {
-        if (index >= self.datas.items.len) return null;
-        return self.datas.items[index];
-    }
-
-    /// remove repeated datas, data may be invalid after this step.
-    pub fn reduce(self: *DataFormat) Allocator.Error!void {
-        const allocator = self.datas.allocator;
-
-        const index_remaps = try allocator.alloc(usize, self.datas.items.len);
-        defer allocator.free(index_remaps);
-
-        var ref_datas: std.ArrayList(*Data) = .init(allocator);
-        defer ref_datas.deinit();
-
-        const DataHashContext = struct {
-            pub fn hash(_: @This(), data: *const Data) u64 {
-                return Data.Payload.HashContext.hash(undefined, data.payload);
-            }
-            pub fn eql(_: @This(), data1: *const Data, data2: *const Data) bool {
-                return Data.Payload.HashContext.eql(undefined, data1.payload, data2.payload);
-            }
-        };
-        var uni_datas: std.HashMap(*const Data, void, DataHashContext, std.hash_map.default_max_load_percentage) = .init(allocator);
-        defer uni_datas.deinit();
-
-        // reduce rules
-        var reduces: std.ArrayList(struct{ from: u64, to: u64 }) = .init(allocator);
-        defer reduces.deinit();
-
-        // find ref datas and repeated value datas
-        for (self.datas.items, 0..) |data, index| {
-            std.debug.assert(index == data.index);
-            if (data.payload.isRef()) {
-                try ref_datas.append(data);
-                continue;
-            }
-            if (uni_datas.getEntry(data)) |repeated| {
-                try reduces.append(.{ .from = data.index, .to = repeated.key_ptr.*.index});
-            }
-            else {
-                try uni_datas.put(data, undefined);
-            }
-        }
-
-        // apply reduce rules to all ref datas
-        const applyReduces = struct {
-            fn foo(reduce_pairs: @TypeOf(reduces), index: *u64) void {
-                // note the field `from` in `replaces` is well ordered
-                for (reduce_pairs.items) |pair| {
-                    if (pair.from == index.*) {
-                        index.* = pair.to;
-                        return;
-                    }
-                    if (pair.from > index.*) return;
-                }
-            }
-        }.foo;
-        for (ref_datas.items) |data| {
-            switch (data.payload) {
-                .pair => |*pair| {
-                    applyReduces(reduces, &pair.@"0");
-                    applyReduces(reduces, &pair.@"1");
-                },
-                .list => |list| {
-                    for (list.indicies.items) |*index| applyReduces(reduces, index);
-                },
-                else => unreachable,
-            }
-        }
-
-        { // remove all repeated value datas
-            var index = reduces.items.len;
-            while (index > 0) {
-                index -= 1;
-                const trash = self.datas.swapRemove(reduces.items[index].from);
-                trash.payload.deinit();
-                allocator.destroy(trash);
-            }
-        }
-        // re-indexing
-        for (self.datas.items, 0..) |data, new_index| {
-            index_remaps[data.index] = new_index;
-            data.index = new_index;
-        }
-        for (ref_datas.items) |data| {
-            switch (data.payload) {
-                .pair => |*pair| {
-                    pair.@"0" = index_remaps[pair.@"0"];
-                    pair.@"1" = index_remaps[pair.@"1"];
-                },
-                .list => |list| {
-                    for (list.indicies.items) |*index| index.* = index_remaps[index.*];
-                },
-                else => unreachable,
-            }
-        }
-
-        while (true) { // remove all repeated ref datas, similar to remove value datas above
-            const sortData = struct {
-                fn foo(_: void, data1: *const Data, data2: *const Data) bool {
-                    return data1.index < data2.index;
-                }
-            }.foo;
-            std.mem.sortUnstable(*Data, ref_datas.items, void{}, sortData);
-            uni_datas.clearRetainingCapacity();
-            reduces.clearRetainingCapacity();
-
-            for (ref_datas.items, 0..) |data, ref_index| {
-                index_remaps[data.index] = ref_index;
-                if (uni_datas.getEntry(data)) |repeated| {
-                    try reduces.append(.{ .from = data.index, .to = repeated.key_ptr.*.index});
-                }
-                else {
-                    try uni_datas.put(data, undefined);
-                }
-            }
-            if (reduces.items.len == 0) return;
-
-            for (ref_datas.items) |data| {
-                switch (data.payload) {
-                    .pair => |*pair| {
-                        applyReduces(reduces, &pair.@"0");
-                        applyReduces(reduces, &pair.@"1");
-                    },
-                    .list => |list| {
-                        for (list.indicies.items) |*index| applyReduces(reduces, index);
-                    },
-                    else => unreachable,
-                }
-            }
-
-            {
-                var index = reduces.items.len;
-                while (index > 0) {
-                    index -= 1;
-                    const trash = self.datas.swapRemove(reduces.items[index].from);
-                    const ref_index = index_remaps[trash.index];
-                    trash.payload.deinit();
-                    allocator.destroy(trash);
-                    _ = ref_datas.swapRemove(ref_index);
-                }
-            }
-            for (self.datas.items, 0..) |data, new_index| {
-                index_remaps[data.index] = new_index;
-                data.index = new_index;
-            }
-            for (ref_datas.items) |data| {
-                switch (data.payload) {
-                    .pair => |*pair| {
-                        pair.@"0" = index_remaps[pair.@"0"];
-                        pair.@"1" = index_remaps[pair.@"1"];
-                    },
-                    .list => |list| {
-                        for (list.indicies.items) |*index| index.* = index_remaps[index.*];
-                    },
-                    else => unreachable,
-                }
-            }
-        }
-    }
-
-    pub const SaveError = Allocator.Error || File.GetSeekPosError || File.WriteError;
-
-    pub fn saveInto(self: DataFormat, file: File) SaveError!usize {
-        var offsets: std.ArrayList(u64) = .init(self.datas.allocator);
-        defer offsets.deinit();
-        try offsets.ensureUnusedCapacity(self.datas.items.len);
-
-        var writed: usize = 0;
-        for (self.datas.items) |data| {
-            offsets.appendAssumeCapacity(try file.getPos());
-            writed += try data.payload.writeInto(file);
-        }
-
-        const offsets_start = try file.getPos();
-        writed += try writeVarInt(file, offsets.items.len);
-        for (offsets.items) |offset| writed += try writeVarInt(file, offset);
-
-        try file.writeAll(entry_lable);
-        writed += entry_lable.len;
-
-        writed += try writeVarInt(file, offsets_start);
-
-        return writed;
-    }
-
-    pub const LoadConfig = struct {
-        /// where to start searching file entry lable
-        entry_lable_search_start: ?u64 = null,
-        /// the size of searching area
-        entry_lable_search_size: u64 = 128,
-    };
-
-    pub const LoadError = error {
-        EntryLableNotFound,
-    } || Data.Payload.ReadError || Allocator.Error || File.GetSeekPosError || File.SeekError || File.ReadError;
-
-    pub fn loadFromAlloc(file: File, allocator: Allocator, cfg: LoadConfig) LoadError!*DataFormat {
-        const entry_pos: u64 = blk: {
-            const file_end = try file.getEndPos();
-
-            const search_start = cfg.entry_lable_search_start orelse
-                if (cfg.entry_lable_search_size > file_end) 0 else (file_end - cfg.entry_lable_search_size)
-            ;
-            std.debug.assert(search_start <= file_end);
-            const search_size = @min(cfg.entry_lable_search_size, file_end - search_start);
-            const search_buff = try allocator.alloc(u8, search_size);
-            defer allocator.free(search_buff);
-
-            try file.seekTo(search_start);
-            const read_len = try file.readAll(search_buff);
-            std.debug.assert(read_len == search_size);
-
-            break :blk std.mem.lastIndexOf(u8, search_buff, entry_lable) orelse return LoadError.EntryLableNotFound;
-        };
-
-        try file.seekTo(entry_pos + entry_lable.len);
-        const offsets_start = try readVarInt(file, u64);
-        try file.seekTo(offsets_start);
-        const offset_count = try readVarInt(file, u64);
-        const offsets = try allocator.alloc(u64, offset_count);
-        defer allocator.free(offsets);
-        for (offsets) |*offset| offset.* = try readVarInt(file, u64);
-
-        const df = try allocator.create(DataFormat);
-        errdefer allocator.destroy(df);
-        df.* = .init(allocator);
-        errdefer df.deinit();
-        try df.datas.ensureUnusedCapacity(offsets.len);
-
-        for (offsets, 0..) |offset, index| {
-            const new_data = try allocator.create(Data);
-            errdefer allocator.destroy(new_data);
-
-            try file.seekTo(offset);
-            new_data.df = df;
-            new_data.index = index;
-            new_data.payload = try .readFrom(file, df);
-
-            df.datas.appendAssumeCapacity(new_data);
-        }
-
-        return df;
-    }
-};
-
-pub const Data = struct {
-    /// should not change this
-    df: *const DataFormat,
-    /// should not change this
-    index: u64,
-    payload: Payload,
+pub const Data = union(Data.Type) {
+    // value types
+    null:   Data.Null,
+    bool:   Data.Bool,
+    byte:   Data.Byte,
+    f16:    Data.F16,
+    f32:    Data.F32,
+    f64:    Data.F64,
+    bytes:  Data.Bytes,
+    string: Data.String,
+    int:    Data.Int,
+    // ref types
+    pair:   Data.Pair,
+    list:   Data.List,
 
     pub const Type = enum(u8) {
         // value types
-        byte = 0,
-        bytes,
-        string,
-        integer,
+        null = 0x00,
+        bool,
+        byte,
+        f16,
         f32,
         f64,
+        bytes,
+        string,
+        int,
         // ref types
         pair = 0x80,
         list,
@@ -351,759 +43,1196 @@ pub const Data = struct {
         }
     };
 
-    pub const Payload = union(Type) {
-        byte: Byte,
-        bytes: Bytes,
-        string: String,
-        integer: Integer,
-        f32: F32,
-        f64: F64,
-        pair: Pair,
-        list: List,
+    pub fn isRef(self: Data) bool {
+        return @as(Data.Type, self).isRef();
+    }
 
-        pub fn isRef(self: Data.Payload) bool {
-            return @as(Data.Type, self).isRef();
+    pub fn updateHash(self: Data, hasher: anytype) void {
+        const tag: Data.Type = self;
+        hasher.update(std.mem.asBytes(&tag));
+
+        switch (self) {
+            inline else => |payload| {
+                payload.updateHash(hasher);
+            }
         }
+    }
 
-        fn init(@"type": Data.Type, df: *const DataFormat) Allocator.Error!Data.Payload {
-            return switch (@"type") { // TODO: use @typeInfo and inline for
-                .byte    => .{ .byte    = .init(df) },
-                .bytes   => .{ .bytes   = .init(df) },
-                .string  => .{ .string  = try .init(df) },
-                .integer => .{ .integer = .init(df) },
-                .f32     => .{ .f32     = .init(df) },
-                .f64     => .{ .f64     = .init(df) },
-                .pair    => .{ .pair    = .init(df) },
-                .list    => .{ .list    = .init(df) },
-            };
+    pub fn eql(self: Data, other: Data) bool {
+        if (@as(Data.Type, self) != @as(Data.Type, other)) return false;
+
+        return switch (self) { // TODO: rewrite using `inline else`
+            .null   => |d| d.eql(other.null  ),
+            .bool   => |d| d.eql(other.bool  ),
+            .byte   => |d| d.eql(other.byte  ),
+            .f16    => |d| d.eql(other.f16   ),
+            .f32    => |d| d.eql(other.f32   ),
+            .f64    => |d| d.eql(other.f64   ),
+            .bytes  => |d| d.eql(other.bytes ),
+            .string => |d| d.eql(other.string),
+            .int    => |d| d.eql(other.int   ),
+            .pair   => |d| d.eql(other.pair  ),
+            .list   => |d| d.eql(other.list  ),
+        };
+    }
+
+    /// automatically call `deinit` based on tagged type
+    pub fn deinit(self: Data) void {
+        switch (self) {
+            inline else => |payload| {
+                const Payload = @TypeOf(payload);
+                if (@hasDecl(Payload, "deinit")) payload.deinit();
+            }
         }
+    }
 
-        fn deinit(self: Data.Payload) void {
-            const tag = std.meta.activeTag(self);
-            inline for (std.meta.fields(Data.Payload)) |field| {
-                if (@field(Data.Type, field.name) == tag) {
-                    @field(self, field.name).deinit();
-                    return;
-                }
-            } else unreachable;
-        }
+    pub const WriteValueIntoError = error { GotRefData };
 
-        pub const HashContext = struct {
-            pub fn hash(_: Payload.HashContext, payload: Data.Payload) u64 {
-                const tag = std.meta.activeTag(payload);
-                inline for (std.meta.fields(Data.Payload)) |field| {
-                    if (@field(Data.Type, field.name) == tag) {
-                        const pl = @field(payload, field.name);
-                        return @TypeOf(pl).HashContext.hash(undefined, pl);
-                    }
+    /// write value data using custom writer, make sure writer has method `writer.write([]const u8) WriteError!usize`,
+    /// return `WriteValueIntoError.GotRefType` if the data is not a value.
+    ///
+    /// check out `WriteIterator` if want to write a array of data as `nyasdf` (nyas data format).
+    pub fn writeValueInto(self: Data, writer: anytype, comptime WriteError: type) (WriteError || WriteValueIntoError)!usize {
+        if (self.isRef()) return WriteValueIntoError.GotRefData;
+        return self.writeValueIntoAssumeNotRef(writer, WriteError);
+    }
+
+    /// write value data using custom writer, make sure writer has method `writer.write([]const u8) WriteError!usize`,
+    /// assume the data is not a ref.
+    ///
+    /// check out `WriteIterator` if want to write a array of data as `nyasdf` (nyas data format).
+    pub fn writeValueIntoAssumeNotRef(self: Data, writer: anytype, comptime WriteError: type) WriteError!usize {
+        assert(!self.isRef());
+        const tag: u8 = @intFromEnum(self);
+        const tag_len = try writer.write((&tag)[0..1]);
+
+        switch (self) {
+            inline else => |payload| {
+                if (@hasDecl(@TypeOf(payload), "writeInto")) {
+                    const payload_len = try payload.writeInto(writer, WriteError);
+                    return tag_len + payload_len;
                 } else unreachable;
-            }
+            },
+        }
+    }
 
-            pub fn eql(_: Payload.HashContext, payload1: Data.Payload, payload2: Data.Payload) bool {
-                const tag = std.meta.activeTag(payload1);
-                if (tag != payload2) return false;
-                inline for (std.meta.fields(Data.Payload)) |field| {
-                    if (@field(Data.Type, field.name) == tag) {
-                        const pl = @field(payload1, field.name);
-                        return @TypeOf(pl).HashContext.eql(undefined, pl, @field(payload2, field.name));
-                    }
-                } else unreachable;
-            }
+    /// read value data using the **correct** type tag, reader position should be just after the type tag,
+    /// make sure reader has method `reader.read([]u8) ReadError!usize`, assume the type tag and the data to be read are not ref.
+    ///
+    /// check out `ReadIterator` if want to read `nyasdf` (nyas data format) from stream.
+    pub fn readValueFromAllocWithTagAssumeNotRef(
+        gpa: Allocator,
+        tag: Data.Type,
+        reader: anytype,
+        comptime ReadError: type
+    ) (GetReadExpectError(ReadError) || Allocator.Error)!Data {
+        return switch (tag) {
+            .null   => .{ .null   = try .readFrom(reader, ReadError) },
+            .bool   => .{ .bool   = try .readFrom(reader, ReadError) },
+            .byte   => .{ .byte   = try .readFrom(reader, ReadError) },
+            .f16    => .{ .f16    = try .readFrom(reader, ReadError) },
+            .f32    => .{ .f32    = try .readFrom(reader, ReadError) },
+            .f64    => .{ .f64    = try .readFrom(reader, ReadError) },
+            .bytes  => .{ .bytes  = try .readFromAlloc(gpa, reader, ReadError) },
+            .string => .{ .string = try .readFromAlloc(gpa, reader, ReadError) },
+            .int    => .{ .int    = try .readFromAlloc(gpa, reader, ReadError) },
+            else    => unreachable,
         };
+    }
 
-        pub fn writeInto(self: Data.Payload, file: File) File.WriteError!usize {
-            const tag: u8 = @intFromEnum(self);
-            try file.writeAll((&tag)[0..1]);
+    pub const Null = struct{
+        pub inline fn updateHash(_: Data.Null, _: anytype) void {}
 
-            return 1 + switch (self) { // TODO: use @typeInfo and inline for
-                .byte    => |payload| try payload.writeInto(file),
-                .bytes   => |payload| try payload.writeInto(file),
-                .string  => |payload| try payload.writeInto(file),
-                .integer => |payload| try payload.writeInto(file),
-                .f32     => |payload| try payload.writeInto(file),
-                .f64     => |payload| try payload.writeInto(file),
-                .pair    => |payload| try payload.writeInto(file),
-                .list    => |payload| try payload.writeInto(file),
-            };
+        pub inline fn eql(_: Data.Null, _: Data.Null) bool { return true; }
+
+        pub inline fn writeInto(_: Data.Null, _: anytype, comptime _: type) error{}!usize { return 0; }
+
+        pub inline fn readFrom(_: anytype, comptime _: type) error{}!Data.Null { return .{}; }
+    };
+
+    pub const Bool = struct {
+        val: bool,
+
+        pub fn updateHash(self: Data.Bool, hasher: anytype) void {
+            const i = @intFromBool(self.val);
+            hasher.update(std.mem.asBytes(&i)[0..1]);
         }
 
-        pub const ReadError = error { GetInvalidDataType } || File.ReadError || Allocator.Error;
-
-        pub fn readFrom(file: File, df: *const DataFormat) ReadError!Data.Payload {
-            var type_num: u8 = 0xFF;
-            _ = try file.readAll((&type_num)[0..1]);
-            const @"type" = std.enums.fromInt(Data.Type, type_num) orelse return ReadError.GetInvalidDataType;
-
-            return switch (@"type") { // TODO: use @typeInfo and inline for
-                .byte    => .{ .byte    = try .readFrom(file, df) },
-                .bytes   => .{ .bytes   = try .readFrom(file, df) },
-                .string  => .{ .string  = try .readFrom(file, df) },
-                .integer => .{ .integer = try .readFrom(file, df) },
-                .f32     => .{ .f32     = try .readFrom(file, df) },
-                .f64     => .{ .f64     = try .readFrom(file, df) },
-                .pair    => .{ .pair    = try .readFrom(file, df) },
-                .list    => .{ .list    = try .readFrom(file, df) },
-            };
+        pub fn eql(self: Data.Bool, other: Data.Bool) bool {
+            return self.val == other.val;
         }
 
-        pub const Byte = struct {
-            /// should not change this
-            df: *const DataFormat,
-            byte: u8,
+        pub fn writeInto(self: Data.Bool, writer: anytype, comptime WriteError: type) WriteError!usize {
+            const i = @intFromBool(self.val);
+            return writer.write(std.mem.asBytes(&i)[0..1]);
+        }
 
-            fn init(df: *const DataFormat) Byte {
-                return .{
-                    .df = df,
-                    .byte = undefined,
-                };
+        pub fn readFrom(reader: anytype, comptime ReadError: type) GetReadExpectError(ReadError)!Data.Bool {
+            var i: u8 = 0;
+            try readExpectFrom(reader, (&i)[0..1], ReadError);
+            return .{ .val = i & 1 != 0 };
+        }
+    };
+
+    pub const Byte = struct {
+        val: u8,
+
+        pub fn updateHash(self: Data.Byte, hasher: anytype) void {
+            hasher.update(std.mem.asBytes(&self.val));
+        }
+
+        pub fn eql(self: Data.Byte, other: Data.Byte) bool {
+            return self.val == other.val;
+        }
+
+        pub fn writeInto(self: Data.Byte, writer: anytype, comptime WriteError: type) WriteError!usize {
+            return writer.write(std.mem.asBytes(&self.val));
+        }
+
+        pub fn readFrom(reader: anytype, comptime ReadError: type) GetReadExpectError(ReadError)!Data.Byte {
+            var self: Data.Byte = .{ .val = undefined };
+            try readExpectFrom(reader, std.mem.asBytes(&self.val), ReadError);
+            return self;
+        }
+    };
+
+    pub const F16 = struct {
+        val: f16,
+
+        pub fn updateHash(self: Data.F16, hasher: anytype) void {
+            hasher.update(std.mem.asBytes(&self.val));
+        }
+
+        pub fn eql(self: Data.F16, other: Data.F16) bool {
+            return @as(u16, @bitCast(self.val)) == @as(u16, @bitCast(other.val));
+        }
+
+        pub fn writeInto(self: Data.F16, writer: anytype, comptime WriteError: type) WriteError!usize {
+            return writer.write(std.mem.asBytes(&self.val));
+        }
+
+        pub fn readFrom(reader: anytype, comptime ReadError: type) GetReadExpectError(ReadError)!Data.F16 {
+            var self: Data.F16 = .{ .val = undefined };
+            try readExpectFrom(reader, std.mem.asBytes(&self.val), ReadError);
+            return self;
+        }
+    };
+
+    pub const F32 = struct {
+        val: f32,
+
+        pub fn updateHash(self: Data.F32, hasher: anytype) void {
+            hasher.update(std.mem.asBytes(&self.val));
+        }
+
+        pub fn eql(self: Data.F32, other: Data.F32) bool {
+            return @as(u32, @bitCast(self.val)) == @as(u32, @bitCast(other.val));
+        }
+
+        pub fn writeInto(self: Data.F32, writer: anytype, comptime WriteError: type) WriteError!usize {
+            return writer.write(std.mem.asBytes(&self.val));
+        }
+
+        pub fn readFrom(reader: anytype, comptime ReadError: type) GetReadExpectError(ReadError)!Data.F32 {
+            var self: Data.F32 = .{ .val = undefined };
+            try readExpectFrom(reader, std.mem.asBytes(&self.val), ReadError);
+            return self;
+        }
+    };
+
+    pub const F64 = struct {
+        val: f64,
+
+        pub fn updateHash(self: Data.F64, hasher: anytype) void {
+            hasher.update(std.mem.asBytes(&self.val));
+        }
+
+        pub fn eql(self: Data.F64, other: Data.F64) bool {
+            return @as(u64, @bitCast(self.val)) == @as(u64, @bitCast(other.val));
+        }
+
+        pub fn writeInto(self: Data.F64, writer: anytype, comptime WriteError: type) WriteError!usize {
+            return writer.write(std.mem.asBytes(&self.val));
+        }
+
+        pub fn readFrom(reader: anytype, comptime ReadError: type) GetReadExpectError(ReadError)!Data.F64 {
+            var self: Data.F64 = .{ .val = undefined };
+            try readExpectFrom(reader, std.mem.asBytes(&self.val), ReadError);
+            return self;
+        }
+    };
+
+    pub const Bytes = struct {
+        val: []const u8,
+
+        pub fn updateHash(self: Data.Bytes, hasher: anytype) void {
+            hasher.update(self.val);
+        }
+
+        pub fn eql(self: Data.Bytes, other: Data.Bytes) bool {
+            return std.mem.eql(u8, self.val, other.val);
+        }
+
+        pub fn writeInto(self: Data.Bytes, writer: anytype, comptime WriteError: type) WriteError!usize {
+            const len_count = try writeVarIntInto(writer, self.val.len, WriteError);
+            const byte_count = try writer.write(self.val);
+            return len_count + byte_count;
+        }
+
+        pub fn readFromAlloc(
+            gpa: Allocator,
+            reader: anytype,
+            comptime ReadError: type
+        ) (GetReadExpectError(ReadError) || Allocator.Error)!Data.Bytes {
+            const len: usize = @intCast(try readVarIntFrom(reader, ReadError));
+            const self: Data.Bytes = .{ .val = try gpa.alloc(u8, len) };
+            errdefer gpa.free(self.val);
+            try readExpectFrom(reader, @constCast(self.val), ReadError);
+            return self;
+        }
+    };
+
+    pub const String = struct {
+        val: [:0]const u8,
+
+        pub fn updateHash(self: Data.String, hasher: anytype) void {
+            hasher.update(self.val);
+        }
+
+        pub fn eql(self: Data.String, other: Data.String) bool {
+            return std.mem.eql(u8, self.val, other.val);
+        }
+
+        pub fn writeInto(self: Data.String, writer: anytype, comptime WriteError: type) WriteError!usize {
+            const len_count = try writeVarIntInto(writer, self.val.len, WriteError);
+            const byte_count = try writer.write(self.val);
+            return len_count + byte_count;
+        }
+
+        pub fn readFromAlloc(
+            gpa: Allocator,
+            reader: anytype,
+            comptime ReadError: type
+        ) (GetReadExpectError(ReadError) || Allocator.Error)!Data.String {
+            const len: usize = @intCast(try readVarIntFrom(reader, ReadError));
+            const self: Data.String = .{ .val = try gpa.allocSentinel(u8, len, 0) };
+            errdefer gpa.free(self.val);
+            try readExpectFrom(reader, @constCast(self.val), ReadError);
+            return self;
+        }
+    };
+
+    pub const Int = struct {
+        /// user should not manipulate this
+        buffer: std.ArrayList(u8),
+        negative: bool = false,
+
+        pub fn init(gpa: Allocator) Data.Int {
+            return .{ .buffer = .init(gpa) };
+        }
+
+        pub fn deinit(self: Data.Int) void {
+            self.buffer.deinit();
+        }
+
+        pub fn updateHash(self: Data.Int, hasher: anytype) void {
+            const n = @intFromBool(self.negative);
+            hasher.update(std.mem.asBytes(&n)[0..1]);
+            hasher.update(self.buffer.items);
+        }
+
+        pub fn eql(self: Data.Int, other: Data.Int) bool {
+            if (self.negative != other.negative) return false;
+            return std.mem.eql(u8, self.buffer.items, other.buffer.items);
+        }
+
+        pub fn writeInto(self: Data.Int, writer: anytype, comptime WriteError: type) WriteError!usize {
+            const len_neg = (self.buffer.items.len << 1) | @intFromBool(self.negative);
+            const len_neg_count = try writeVarIntInto(writer, len_neg, WriteError);
+            const byte_count = try writer.write(self.buffer.items);
+            return len_neg_count + byte_count;
+        }
+
+        pub fn readFromAlloc(
+            gpa: Allocator,
+            reader: anytype,
+            comptime ReadError: type
+        ) (GetReadExpectError(ReadError) || Allocator.Error)!Data.Int {
+            const len_neg: usize = @intCast(try readVarIntFrom(reader, ReadError));
+            var self: Data.Int = .init(gpa);
+            errdefer self.deinit();
+            self.negative = len_neg & 1 != 0;
+            try self.buffer.resize(len_neg >> 1);
+            try readExpectFrom(reader, self.buffer.items, ReadError);
+            return self;
+        }
+
+        pub fn set(self: *Data.Int, int: anytype) Allocator.Error!void {
+            const info = @typeInfo(@TypeOf(int));
+            if (info != .int) @compileError(@typeName(Data.Int) ++ " only accepts integers.");
+            const is_signed = info.int.signedness == .signed;
+            const bit_count = info.int.bits;
+            const UInt = std.meta.Int(.unsigned, bit_count);
+
+            const is_neg = int < 0; // can be determined in comptime if int is a unsigned integer
+            self.negative = is_neg;
+            const uint: UInt = if (is_signed) @bitCast(if (is_neg) -%int else int) else int;
+
+            const byte_count = std.math.divCeil(u16, bit_count - @clz(uint), 8) catch unreachable;
+            try self.buffer.resize(byte_count);
+            @memcpy(self.buffer.items, std.mem.asBytes(&uint)[0..byte_count]);
+        }
+
+        /// apply `bitCast` and `truncate` automatically
+        pub fn get(self: Data.Int, comptime I: type) I {
+            if (@typeInfo(I) != .int) @compileError(@typeName(Data.Int) ++ " only accepts integers.");
+
+            var int = std.mem.zeroes(I);
+            const bytes = std.mem.asBytes(&int);
+            const byte_count = @min(bytes.len, self.buffer.items.len);
+            @memcpy(bytes[0..byte_count], self.buffer.items[0..byte_count]);
+
+            return if (self.negative) -%int else int;
+        }
+
+        /// the bit count that can fit the integer without truncation.
+        pub fn minFitableBits(self: Data.Int) u16 {
+            if (self.buffer.items.len == 0) return 0;
+            const max_int_byte_count = comptime std.math.divCeil(u16, std.math.maxInt(u16), 8) catch unreachable;
+            assert(self.buffer.items.len <= max_int_byte_count);
+            assert(self.buffer.getLast() != 0);
+            const last_byte_leading_zero_bit_count = @clz(self.buffer.getLast());
+            var bit_count = 8 * self.buffer.items.len - last_byte_leading_zero_bit_count + @intFromBool(self.negative);
+            // check for negative power of 2
+            if (self.negative and std.math.isPowerOfTwo(self.buffer.getLast())) {
+                for (self.buffer.items[0..self.buffer.items.len-1]) |byte| {
+                    if (byte != 0) break;
+                } else bit_count -= 1;
             }
-
-            fn deinit(self: Byte) void {
-                _ = self;
-            }
-
-            pub const HashContext = struct {
-                pub fn hash(_: Byte.HashContext, byte: Byte) u64 {
-                    return byte.byte;
-                }
-
-                pub fn eql(_: Byte.HashContext, byte1: Byte, byte2: Byte) bool {
-                    return byte1.byte == byte2.byte;
-                }
-            };
-
-            pub fn writeInto(self: Byte, file: File) File.WriteError!usize {
-                try file.writeAll((&self.byte)[0..1]);
-                return 1;
-            }
-
-            pub fn readFrom(file: File, df: *const DataFormat) File.ReadError!Byte {
-                var self: Byte = .init(df);
-                errdefer self.deinit();
-                _ = try file.readAll((&self.byte)[0..1]);
-                return self;
-            }
-
-            pub fn set(self: *Byte, val: u8) void {
-                self.byte = val;
-            }
-
-            pub fn get(self: *Byte) u8 {
-                return self.byte;
-            }
-        };
-
-        /// always assume bytes are little endian
-        pub const Bytes = struct {
-            /// should not change this
-            df: *const DataFormat,
-            bytes: []u8,
-
-            fn init(df: *const DataFormat) Bytes {
-                return .{
-                    .df = df,
-                    .bytes = &.{},
-                };
-            }
-
-            fn deinit(self: Bytes) void {
-                self.df.datas.allocator.free(self.bytes);
-            }
-
-            pub const HashContext = struct {
-                pub fn hash(_: Bytes.HashContext, bytes: Bytes) u64 {
-                    return std.hash.Wyhash.hash(0, bytes.bytes);
-                }
-
-                pub fn eql(_: Bytes.HashContext, bytes1: Bytes, bytes2: Bytes) bool {
-                    return std.mem.eql(u8, bytes1.bytes, bytes2.bytes);
-                }
-            };
-
-            pub fn writeInto(self: Bytes, file: File) File.WriteError!usize {
-                const len_len = try writeVarInt(file, self.bytes.len);
-                try file.writeAll(self.bytes);
-                return len_len + self.bytes.len;
-            }
-
-            pub fn readFrom(file: File, df: *const DataFormat) (File.ReadError || Allocator.Error)!Bytes {
-                const len = try readVarInt(file, u64);
-                const bytes = try df.datas.allocator.alloc(u8, len);
-                errdefer df.datas.allocator.free(bytes);
-                _ = try file.readAll(bytes);
-                return .{ .df = df, .bytes = bytes };
-            }
-
-            pub fn set(self: *Bytes, val: []const u8) Allocator.Error!void {
-                const allocator = self.df.datas.allocator;
-                if (allocator.resize(self.bytes, val.len)) {
-                    self.bytes.len = val.len;
-                    @memcpy(self.bytes, val);
-                }
-                else {
-                    allocator.free(self.bytes);
-                    self.bytes.len = 0;
-                    self.bytes = try allocator.dupe(u8, val);
-                }
-            }
-
-            pub fn get(self: @This()) []u8 {
-                return self.bytes;
-            }
-        };
-
-        pub const String = struct {
-            /// should not change this
-            df: *const DataFormat,
-            string: [:0]u8,
-
-            fn init(df: *const DataFormat) Allocator.Error!String {
-                return .{
-                    .df = df,
-                    .string = try df.datas.allocator.allocSentinel(u8, 0, 0),
-                };
-            }
-
-            fn deinit(self: String) void {
-                self.df.datas.allocator.free(self.string);
-            }
-
-            pub const HashContext = struct {
-                pub fn hash(_: String.HashContext, string: String) u64 {
-                    return std.hash.Wyhash.hash(0, string.string);
-                }
-
-                pub fn eql(_: String.HashContext, string1: String, string2: String) bool {
-                    return std.mem.orderZ(u8, string1.string, string2.string) == .eq;
-                }
-            };
-
-            pub fn writeInto(self: String, file: File) File.WriteError!usize {
-                const len_len = try writeVarInt(file, self.string.len);
-                try file.writeAll(self.string);
-                return len_len + self.string.len;
-            }
-
-            pub fn readFrom(file: File, df: *const DataFormat) (File.ReadError || Allocator.Error)!String {
-                const len = try readVarInt(file, u64);
-                const string = try df.datas.allocator.allocSentinel(u8, len, 0);
-                errdefer df.datas.allocator.free(string);
-                _ = try file.readAll(string);
-                return .{ .df = df, .string = string };
-            }
-
-            pub fn set(self: *String, val: [:0]const u8) Allocator.Error!void {
-                const allocator = self.df.datas.allocator;
-                const bytes = self.string[0..self.string.len + 1];
-                if (allocator.resize(bytes, val.len + 1)) {
-                    bytes[val.len] = 0;
-                    self.string.len = val.len;
-                    @memcpy(self.string, val);
-                }
-                else {
-                    allocator.free(self.string);
-                    self.string = try allocator.dupeZ(u8, val);
-                }
-            }
-
-            pub fn get(self: String) [:0]u8 {
-                return self.string;
-            }
-        };
-
-        pub const Integer = struct {
-            /// should not change this
-            df: *const DataFormat,
-            /// should not change this
-            data: [*]u8,
-            /// should not change this
-            is_negative: bool,
-            /// should not change this
-            abs_bits: u16,
-
-            fn init(df: *const DataFormat) Integer {
-                return .{
-                    .df = df,
-                    .data = empty_data,
-                    .is_negative = false,
-                    .abs_bits = 0,
-                };
-            }
-
-            fn deinit(self: Integer) void {
-                self.df.datas.allocator.free(self.data[0..self.dataLength()]);
-            }
-
-            pub const HashContext = struct {
-                pub fn hash(_: Integer.HashContext, int: Integer) u64 {
-                    var hasher = std.hash.Wyhash.init(@intFromBool(int.is_negative));
-                    hasher.update(int.data[0..int.dataLength()]);
-                    return hasher.final();
-                }
-
-                pub fn eql(_: Integer.HashContext, int1: Integer, int2: Integer) bool {
-                    const data_len = int1.dataLength();
-                    return int1.is_negative == int2.is_negative and int1.abs_bits == int2.abs_bits
-                        and std.mem.eql(u8, int1.data[0..data_len], int2.data[0..data_len]);
-                }
-            };
-
-            pub fn writeInto(self: Integer, file: File) File.WriteError!usize {
-                const data_len = self.dataLength();
-                const header = (@as(u15, data_len) << 1) | @intFromBool(self.is_negative);
-                const header_len = try writeVarInt(file, header);
-                try file.writeAll(self.data[0..data_len]);
-                return @as(usize, header_len) + data_len;
-            }
-
-            pub fn readFrom(file: File, df: *const DataFormat) (File.ReadError || Allocator.Error)!Integer {
-                var self: Integer = .init(df);
-                errdefer self.deinit();
-
-                const header = try readVarInt(file, u15);
-                const data_len: u24 = header >> 1;
-                if (data_len == 0) return self;
-                const data = try df.datas.allocator.alloc(u8, data_len);
-                errdefer df.datas.allocator.free(data);
-                _ = try file.readAll(data);
-
-                const empty_bits = @clz(data[data_len - 1]);
-                std.debug.assert(empty_bits != 8);
-                const abs_bits = data_len * 8 - empty_bits;
-                std.debug.assert(abs_bits <= std.math.maxInt(u16));
-
-                self.is_negative = header & 1 != 0;
-                self.abs_bits = @truncate(abs_bits);
-                self.data = data.ptr;
-                return self;
-            }
-
-            /// SAFETY: `val` cannot be `-2^(n-1)` for n-bit signed integer
-            pub fn set(self: *Integer, val: anytype) Allocator.Error!void {
-                const info = @typeInfo(@TypeOf(val));
-                if (info != .int) @compileError(@typeName(Integer) ++ ".set only accepts integers");
-                const UInt = std.meta.Int(.unsigned, info.int.bits);
-                // `-2^(n-1)` for n-bit signed integer may cause numerical error, see `.minFitableBits`
-                if (info.int.signedness == .signed) std.debug.assert(val != std.math.minInt(@TypeOf(val)));
-                const MaxSInt = std.meta.Int(.signed, std.math.maxInt(u16));
-
-                const allocator = self.df.datas.allocator;
-                var data: []u8 = self.data[0..self.dataLength()];
-                if (val == 0) {
-                    allocator.free(data);
-                    self.data = empty_data;
-                    self.abs_bits = 0;
-                    return;
-                }
-
-                const neg = if (@TypeOf(val) == MaxSInt)
-                    val < 0 and val != std.math.minInt(MaxSInt) // see `.minFitableBits`
-                else
-                    val < 0 // this can determite at comptime if val is a uint
-                ;
-                self.is_negative = neg;
-                var uint: UInt = @bitCast(val);
-                if (neg) uint = -%uint;
-                const bits = info.int.bits - @clz(uint);
-                if (big_endian) uint = @byteSwap(uint);
-                const bytes: [*]const u8 = @ptrCast(&uint);
-
-                const data_len: u14 = @truncate((bits / 8) + @intFromBool(bits % 8 != 0));
-                if (!allocator.resize(data, data_len)) {
-                    allocator.free(data);
-                    self.abs_bits = 0;
-                    data = try allocator.alloc(u8, data_len);
-                    self.data = data.ptr;
-                }
-                self.abs_bits = bits;
-                @memcpy(data, bytes);
-
-                const extra_bits: u3 = @truncate(self.abs_bits % 8);
-                if (extra_bits != 0) { // clean dirty data outside the integer in last byte
-                    const data_mask = (@as(u8, 1) << extra_bits) - 1;
-                    data[data_len - 1] &= data_mask;
-                }
-            }
-
-            /// truncate if the bit size of `Int` is less than `.minFitableBits()`,
-            /// always use bit cast regardless of the signedness.
-            pub fn get(self: Integer, comptime Int: type) Int {
-                const info = @typeInfo(Int);
-                if (info != .int) @compileError(@typeName(Integer) ++ ".get only accepts integer types");
-                const IntBuffer = [@sizeOf(Int)] u8;
-
-                if (self.abs_bits == 0) return 0;
-
-                var int_buffer = std.mem.zeroes(IntBuffer);
-                @memcpy(int_buffer[0..@min(int_buffer.len, self.dataLength())], self.data);
-
-                const int: *Int = @ptrCast(@alignCast(&int_buffer));
-                if (big_endian) int.* = @byteSwap(int.*);
-                if (self.is_negative) int.* = -%int.*;
-
-                return int.*;
-            }
-
-            pub fn minFitableBits(self: Integer) u16 {
-                if (self.abs_bits == 0) return 0;
-                // ? check for `-2^n`, `-2^n` can fit into n-bit instead of (n+1)-bit integer.
-                return std.math.add(u16, self.abs_bits, @intFromBool(self.is_negative)) catch unreachable;
-            }
-
-            const empty_data: [*]u8 = @ptrFromInt(std.math.maxInt(usize));
-
-            fn dataLength(self: Integer) u14 {
-                return @truncate((self.abs_bits / 8) + @intFromBool(self.abs_bits % 8 != 0));
-            }
-        };
-
-        pub const F32 = struct {
-            /// should not change this
-            df: *const DataFormat,
-            le_f32: f32,
-
-            fn init(df: *const DataFormat) F32 {
-                return .{
-                    .df = df,
-                    .le_f32 = undefined,
-                };
-            }
-
-            fn deinit(self: F32) void {
-                _ = self;
-            }
-
-            pub const HashContext = struct {
-                pub fn hash(_: F32.HashContext, f: F32) u64 {
-                    return std.hash.int(@as(u32, @bitCast(f.le_f32)));
-                }
-
-                pub fn eql(_: F32.HashContext, f1: F32, f2: F32) bool {
-                    return @as(u32, @bitCast(f1.le_f32)) == @as(u32, @bitCast(f2.le_f32));
-                }
-            };
-
-            pub fn writeInto(self: F32, file: File) File.WriteError!usize {
-                const bit: [@sizeOf(f32)]u8 = @bitCast(self.le_f32);
-                try file.writeAll(&bit);
-                return @sizeOf(f32);
-            }
-
-            pub fn readFrom(file: File, df: *const DataFormat) File.ReadError!F32 {
-                var self: F32 = .init(df);
-                errdefer self.deinit();
-                const ptr: [*]u8 = @ptrCast(&self.le_f32);
-                _ = try file.readAll(ptr[0..@sizeOf(f32)]);
-                return self;
-            }
-
-            pub fn set(self: *F32, val: f32) void {
-                if (big_endian) {
-                    const i: u32 = @bitCast(val);
-                    const le_i = @byteSwap(i);
-                    self.le_f32 = @bitCast(le_i);
-                }
-                else {
-                    self.le_f32 = val;
-                }
-            }
-
-            pub fn get(self: *F32) f32 {
-                if (big_endian) {
-                    const le_i: u32 = @bitCast(self.le_f32);
-                    const i = @byteSwap(le_i);
-                    return @bitCast(i);
-                }
-                else {
-                    return self.le_f32;
-                }
-            }
-        };
-
-        pub const F64 = struct {
-            /// should not change this
-            df: *const DataFormat,
-            le_f64: f64,
-
-            fn init(df: *const DataFormat) F64 {
-                return .{
-                    .df = df,
-                    .le_f64 = undefined,
-                };
-            }
-
-            fn deinit(self: F64) void {
-                _ = self;
-            }
-
-            pub const HashContext = struct {
-                pub fn hash(_: F64.HashContext, f: F64) u64 {
-                    return std.hash.int(@as(u64, @bitCast(f.le_f64)));
-                }
-
-                pub fn eql(_: F64.HashContext, f1: F64, f2: F64) bool {
-                    return @as(u64, @bitCast(f1.le_f64)) == @as(u64, @bitCast(f2.le_f64));
-                }
-            };
-
-            pub fn writeInto(self: F64, file: File) File.WriteError!usize {
-                const bit: [@sizeOf(f64)]u8 = @bitCast(self.le_f64);
-                try file.writeAll(&bit);
-                return @sizeOf(f64);
-            }
-
-            pub fn readFrom(file: File, df: *const DataFormat) File.ReadError!F64 {
-                var self: F64 = .init(df);
-                errdefer self.deinit();
-                const ptr: [*]u8 = @ptrCast(&self.le_f64);
-                _ = try file.readAll(ptr[0..@sizeOf(f64)]);
-                return self;
-            }
-
-            pub fn set(self: *F64, val: f64) void {
-                if (big_endian) {
-                    const i: u64 = @bitCast(val);
-                    const le_i = @byteSwap(i);
-                    self.le_f64 = @bitCast(le_i);
-                }
-                else {
-                    self.le_f64 = val;
-                }
-            }
-
-            pub fn get(self: *F64) f64 {
-                if (big_endian) {
-                    const le_i: u64 = @bitCast(self.le_f64);
-                    const i = @byteSwap(le_i);
-                    return @bitCast(i);
-                }
-                else {
-                    return self.le_f64;
-                }
-            }
-        };
-
-        pub const Pair = struct {
-            /// should not change this
-            df: *const DataFormat,
-            @"0": u64,
-            @"1": u64,
-
-            fn init(df: *const DataFormat) Pair {
-                return .{
-                    .df = df,
-                    .@"0" = undefined,
-                    .@"1" = undefined,
-                };
-            }
-
-            fn deinit(self: Pair) void {
-                _ = self;
-            }
-
-            pub const HashContext = struct {
-                pub fn hash(_: Pair.HashContext, pair: Pair) u64 {
-                    var hasher = std.hash.Wyhash.init(0);
-                    hasher.update(std.mem.asBytes(&pair.@"0"));
-                    hasher.update(std.mem.asBytes(&pair.@"1"));
-                    return hasher.final();
-                }
-
-                pub fn eql(_: Pair.HashContext, pair1: Pair, pair2: Pair) bool {
-                    return pair1.@"0" == pair2.@"0" and pair1.@"1" == pair2.@"1";
-                }
-            };
-
-            pub fn writeInto(self: Pair, file: File) File.WriteError!usize {
-                return try writeVarInt(file, self.@"0") + try writeVarInt(file, self.@"1");
-            }
-
-            pub fn readFrom(file: File, df: *const DataFormat) File.ReadError!Pair {
-                var self: Pair = .init(df);
-                errdefer self.deinit();
-                self.@"0" = try readVarInt(file, u64);
-                self.@"1" = try readVarInt(file, u64);
-                return self;
-            }
-
-            pub const SetError = error { NotInTheSameDataFormat };
-
-            pub fn set0(self: *Pair, data: *const Data) SetError!void {
-                if (self.df != data.df) return SetError.NotInTheSameDataFormat;
-                self.@"0" = data.index;
-            }
-            pub fn set1(self: *Pair, data: *const Data) SetError!void {
-                if (self.df != data.df) return SetError.NotInTheSameDataFormat;
-                self.@"1" = data.index;
-            }
-            pub fn set(self: *Pair, @"0": *const Data, @"1": *const Data) SetError!void {
-                try self.set0(@"0");
-                try self.set1(@"1");
-            }
-
-            pub fn tryGet0(self: Pair) ?*Data {
-                const datas = self.df.datas;
-                if (self.@"0" >= datas.items.len) return null;
-                return datas.items[self.@"0"];
-            }
-            pub fn tryGet1(self: Pair) ?*Data {
-                const datas = self.df.datas;
-                if (self.@"1" >= datas.items.len) return null;
-                return datas.items[self.@"1"];
-            }
-            pub fn tryGet(self: Pair) struct{?*Data, ?*Data} {
-                return .{self.tryGet0(), self.tryGet1()};
-            }
-
-            pub fn get0(self: Pair) *Data {
-                const datas = self.df.datas;
-                return datas.items[self.@"0"];
-            }
-            pub fn get1(self: Pair) *Data {
-                const datas = self.df.datas;
-                return datas.items[self.@"1"];
-            }
-            pub fn get(self: Pair) struct{*Data, *Data} {
-                return .{self.get0(), self.get1()};
-            }
-        };
-
-        pub const List = struct {
-            /// should not change this
-            df: *const DataFormat,
-            indicies: std.ArrayList(u64),
-
-            fn init(df: *const DataFormat) List {
-                return .{
-                    .df = df,
-                    .indicies = .init(df.datas.allocator),
-                };
-            }
-
-            fn deinit(self: List) void {
-                self.indicies.deinit();
-            }
-
-            pub const HashContext = struct {
-                pub fn hash(_: List.HashContext, list: List) u64 {
-                    var hasher = std.hash.Wyhash.init(0);
-                    for (list.indicies.items) |index| hasher.update(std.mem.asBytes(&index));
-                    return hasher.final();
-                }
-
-                pub fn eql(_: List.HashContext, list1: List, list2: List) bool {
-                    return std.mem.eql(u64, list1.indicies.items, list2.indicies.items);
-                }
-            };
-
-            pub fn writeInto(self: List, file: File) File.WriteError!usize {
-                var count = try writeVarInt(file, self.indicies.items.len);
-                for (self.indicies.items) |index| count += try writeVarInt(file, index);
-                return count;
-            }
-
-            pub fn readFrom(file: File, df: *const DataFormat) (File.ReadError || Allocator.Error)!List {
-                var self: List = .init(df);
-                errdefer self.deinit();
-
-                var count = try readVarInt(file, u64);
-                try self.indicies.ensureUnusedCapacity(count);
-                while (count > 0) : (count -= 1) {
-                    self.indicies.appendAssumeCapacity(try readVarInt(file, u64));
-                }
-
-                return self;
-            }
-
-            pub const AppendError = error { NotInTheSameDataFormat } || Allocator.Error;
-
-            pub fn append(self: *List, data: *const Data) AppendError!void {
-                if (self.df != data.df) return AppendError.NotInTheSameDataFormat;
-                try self.indicies.append(data.index);
-            }
-
-            pub fn appendSlise(self: *List, datas: []const *const Data) AppendError!void {
-                for (datas) |data| {
-                    if (self.df != data.df) return AppendError.NotInTheSameDataFormat;
-                }
-                try self.indicies.ensureUnusedCapacity(datas.len);
-                const old_len = self.indicies.items.len;
-                self.indicies.items.len += datas.len;
-                const new_slice = self.indicies.items[old_len..];
-                for (datas, new_slice) |data, *index| index.* = data.index;
-            }
-
-            pub fn length(self: List) usize {
-                return self.indicies.items.len;
-            }
-
-            pub fn pop(self: *List) ?*Data {
-                const datas = self.df.datas;
-                const index = self.indicies.pop() orelse return null;
-                if (index >= datas.items.len) return null;
-                return datas.items[index];
-            }
-
-            pub fn get(self: List, index: usize) *Data {
-                const k = self.indicies.items[index];
-                return self.df.datas.items[k];
-            }
-
-            pub fn tryGet(self: List, index: usize) ?*Data {
-                const datas = self.df.datas;
-                if (index >= self.indicies.items.len) return null;
-                const k = self.indicies.items[index];
-                if (k >= datas.items.len) return null;
-                return datas.items[k];
-            }
-
-            pub const Iterator = struct {
-                list: *const List,
-                index: usize = 0,
-
-                pub fn next(self: *List.Iterator) ?*Data {
-                    const datas = self.list.df.datas.items;
-                    if (self.index >= self.list.length()) return null;
-                    const k = self.list.indicies.items[self.index];
-                    self.index += 1;
-                    return datas[k];
-                }
-            };
-
-            pub fn iter(self: *const List) List.Iterator {
-                return .{ .list = self };
-            }
-        };
+            assert(bit_count <= std.math.maxInt(u16));
+            return @truncate(bit_count);
+        }
+    };
+
+    pub const Pair = struct {
+        @"0": *const Data,
+        @"1": *const Data,
+
+        pub fn updateHash(self: Data.Pair, hasher: anytype) void {
+            hasher.update(std.mem.asBytes(&self.@"0"));
+            hasher.update(std.mem.asBytes(&self.@"1"));
+        }
+
+        pub fn eql(self: Data.Pair, other: Data.Pair) bool {
+            return self.@"0" == other.@"0" and self.@"1" == other.@"1";
+        }
+    };
+
+    pub const List = struct {
+        val: std.ArrayListUnmanaged(*const Data) = .empty,
+
+        pub fn updateHash(self: Data.List, hasher: anytype) void {
+            for (self.val.items) |data| hasher.update(std.mem.asBytes(&data));
+        }
+
+        pub fn eql(self: Data.List, other: Data.List) bool {
+            return std.mem.eql(*const Data, self.val.items, other.val.items);
+        }
     };
 };
 
 
-fn writeVarInt(file: File, int: anytype) File.WriteError!usize {
-    const info = @typeInfo(@TypeOf(int));
-    if (info != .int and info.int.signedness == .unsigned) @compileError("only accepts unsigned integer");
+pub const DataHashContext = struct {
+    pub fn hash(_: DataHashContext, data: Data) u64 {
+        var hasher: std.hash.Wyhash = .init(0);
+        data.updateHash(&hasher);
+        return hasher.final();
+    }
 
-    const first: u8 = @truncate(int & 0x7F);
-    try file.writeAll((&first)[0..1]);
+    pub fn eql(_: DataHashContext, data1: Data, data2: Data) bool {
+        return data1.eql(data2);
+    }
+};
 
-    var count: usize = 1;
-    var i = int >> 7;
+/// reduce duplicate data for given data slice.
+///
+/// for fine control, call `reduceStart` first then `reduceContinue` looply,
+/// return false if no duplicate data was found.
+/// all non-duplicate data are moved to beginning of the slice given in `reduceStart`,
+/// and its length is stored in `keeping_count`.
+///
+/// see also `reduceDirect` for directly reducion without fine control.
+pub const Reducer = struct {
+    allocator: Allocator,
+    slice_indices: DataPtrMap(usize) = .empty,
+    cached_hashes: DataPtrMap(u64) = .empty,
+    refs: DataPtrMap(void) = .empty,
+    data_set: DataSet = .empty,
+    replaces: DataPtrMap(*Data) = .empty,
+    /// the data slice given in `reduceStart`,
+    /// the beginning part `0..keep_count` should not be changed during reduction.
+    slice: []*Data,
+    /// the non-duplicate data count after reduction
+    keeping_count: usize = 0,
+
+    const CachedDataHashContext = struct {
+        hashes: *DataPtrMap(u64),
+
+        pub fn hash(self: CachedDataHashContext, data: *Data) u64 {
+            const result = self.hashes.getOrPutAssumeCapacity(data);
+            if (!result.found_existing) result.value_ptr.* = DataHashContext.hash(undefined, data.*);
+            return result.value_ptr.*;
+        }
+        pub fn eql(_: CachedDataHashContext, data1: *Data, data2: *Data) bool {
+            return DataHashContext.eql(undefined, data1.*, data2.*);
+        }
+    };
+    const DataPtrHashContext = struct {
+        pub fn hash(_: DataPtrHashContext, data: *Data) u64 {
+            return @intFromPtr(data); // extream performance, but what's the cost?
+        }
+        pub fn eql(_: DataPtrHashContext, data1: *Data, data2: *Data) bool {
+            return data1 == data2;
+        }
+    };
+
+    const DataSet = std.HashMapUnmanaged(*Data, void, CachedDataHashContext, std.hash_map.default_max_load_percentage);
+    fn DataPtrMap(comptime T: type) type {
+        return std.HashMapUnmanaged(*Data, T, DataPtrHashContext, std.hash_map.default_max_load_percentage);
+    }
+
+    pub fn init(gpa: Allocator) Reducer {
+        return .{ .allocator = gpa, .slice = &.{} };
+    }
+
+    pub fn deinit(self: *Reducer) void {
+        self.slice_indices.deinit(self.allocator);
+        self.cached_hashes.deinit(self.allocator);
+        self.refs.deinit(self.allocator);
+        self.data_set.deinit(self.allocator);
+        self.replaces.deinit(self.allocator);
+    }
+
+    /// start to reduce the given data slice, return true if any data was reduced.
+    /// call `reduceContinue` for more reduction after this step.
+    pub fn reduceStart(self: *Reducer, slice: []*Data) Allocator.Error!bool {
+        assert(slice.len <= std.math.maxInt(u32));
+        const data_set_ctx: CachedDataHashContext = .{ .hashes = &self.cached_hashes };
+        self.slice = slice;
+        self.keeping_count = slice.len;
+        if (self.keeping_count == 0) return false;
+
+        self.keeping_count = slice.len;
+        self.slice_indices.clearRetainingCapacity();
+        try self.slice_indices.ensureTotalCapacity(self.allocator, @truncate(slice.len));
+        self.cached_hashes.clearRetainingCapacity();
+        try self.cached_hashes.ensureTotalCapacity(self.allocator, @truncate(slice.len));
+        self.refs.clearRetainingCapacity();
+        self.data_set.clearRetainingCapacity();
+        try self.data_set.ensureTotalCapacityContext(self.allocator, @truncate(slice.len), data_set_ctx);
+        self.replaces.clearRetainingCapacity();
+
+        for (slice, 0..) |data, index| {
+            self.slice_indices.putAssumeCapacityNoClobber(data, index);
+            if (data.isRef()) try self.refs.putNoClobber(self.allocator, data, undefined);
+
+            const result = self.data_set.getOrPutAssumeCapacityContext(data, data_set_ctx);
+            if (result.found_existing) {
+                try self.replaces.put(self.allocator, data, result.key_ptr.*);
+            }
+        }
+
+        if (self.replaces.size == 0) return false;
+        self.applyReplacesToRefs();
+        self.rearrangeSlice();
+        return true;
+    }
+
+    /// continue to reduce data slice given in `reduceStart`, return true if any data was reduced.
+    /// should call this step looply until no data was reduced or reached to maximum reducion steps.
+    ///
+    /// note the beginning part `0..keep_count` of the slice should not be changed during reduction.
+    pub fn reduceContinue(self: *Reducer) Allocator.Error!bool {
+        const data_set_ctx: CachedDataHashContext = .{ .hashes = &self.cached_hashes };
+        if (self.keeping_count == 0) return false;
+
+        self.data_set.clearRetainingCapacity();
+        self.replaces.clearRetainingCapacity();
+
+        var ref_iter = self.refs.keyIterator();
+        while (ref_iter.next()) |p_ref| {
+            const result = self.data_set.getOrPutAssumeCapacityContext(p_ref.*, data_set_ctx);
+            if (result.found_existing) {
+                try self.replaces.put(self.allocator, p_ref.*, result.key_ptr.*);
+            }
+        }
+
+        if (self.replaces.size == 0) return false;
+        self.applyReplacesToRefs();
+        self.rearrangeSlice();
+        return true;
+    }
+
+    /// the data slice after reduction, this is the beginning part of the data slice given in `reduceStart`.
+    /// data outside of this slice can be safely freed (assume all referenced data are also in the original slice).
+    pub fn keepingSlice(self: Reducer) []const *Data {
+        return self.slice[0..self.keeping_count];
+    }
+
+    fn applyReplacesToRefs(self: *Reducer) void {
+        // remove duplicate ref data in self.refs
+        var replace_iter = self.replaces.keyIterator();
+        while (replace_iter.next()) |p_replaced_data| {
+            _ = self.refs.remove(p_replaced_data.*);
+        }
+        // apply replaces to ref data
+        var ref_iter = self.refs.keyIterator();
+        while (ref_iter.next()) |p_ref| {
+            var changed = false;
+            switch (p_ref.*.*) {
+                .pair => |*p| {
+                    changed |= self.applyReplaces(&p.@"0");
+                    changed |= self.applyReplaces(&p.@"1");
+                },
+                .list => |l| {
+                    for (l.val.items) |*data| changed |= self.applyReplaces(data);
+                },
+                else => unreachable,
+            }
+            if (changed) _ = self.cached_hashes.remove(p_ref.*);
+        }
+    }
+
+    fn applyReplaces(self: Reducer, p_data: **const Data) bool {
+        if (self.replaces.get(@constCast(p_data.*))) |replace_to| {
+            p_data.* = replace_to;
+            return true;
+        }
+        return false;
+    }
+
+    fn rearrangeSlice(self: *Reducer) void {
+        var replace_iter = self.replaces.keyIterator();
+        while (replace_iter.next()) |p_replaced_data| {
+            self.keeping_count -= 1;
+            const replaced_index = self.slice_indices.get(p_replaced_data.*).?;
+            std.mem.swap(*Data, &self.slice[replaced_index], &self.slice[self.keeping_count]);
+            self.slice_indices.putAssumeCapacity(p_replaced_data.*, self.keeping_count);
+            self.slice_indices.putAssumeCapacity(self.slice[replaced_index], replaced_index);
+        }
+    }
+
+    /// one line reduction for someone who don't care fine control and don't want to write template code over again and again,
+    /// such as me.
+    ///
+    /// return the non-duplicate data count after reduction, these data are at the beginning of the slice,
+    /// data after these can be safely freed (assume all referenced data are also in the original slice).
+    pub fn reduceDirect(gpa: Allocator, slice: []*Data, max_reduction_count: ?u32) Allocator.Error!usize {
+        if (max_reduction_count != null and max_reduction_count == 0) return slice.len;
+        var count_down = max_reduction_count orelse std.math.maxInt(u32);
+
+        var self: Reducer = .init(gpa);
+        defer self.deinit();
+
+        if (try self.reduceStart(slice)) {
+            count_down -= 1;
+            while (count_down > 0 and try self.reduceContinue()) : (count_down -= 1) {}
+        }
+
+        return self.keeping_count;
+    }
+};
+
+
+/// write nyasdf (nyas Data Format) into something, such as into file (see `FileWriteIterator`).
+///
+/// for fine control, use `setDataSlice` to set the data slice to write, optionly call `ensureDataValid` to validfy data,
+/// then call `writeNext` looply to write data util null is returned indicating that all data has been written,
+/// and finally call `writePosTable` and `writeEntry` to complete the nyasdf write.
+///
+/// see also `writeDirect` for directly writing without fine control.
+pub fn WriteIterator(
+    comptime Context: type,
+    comptime WriteErrorSet: type,
+    comptime writeFn: fn (ctx: Context, bytes: []const u8) WriteErrorSet!usize,
+    comptime GetSeekPosErrorSet: type,
+    comptime getPosFn: fn (ctx: Context) GetSeekPosErrorSet!u64,
+) type {
+    return struct {
+        context: Context,
+        allocator: Allocator,
+        /// available after `writePosTable`
+        table_pos: ?u64 = null,
+        pos_table: std.ArrayListUnmanaged(u64) = .empty,
+        slice_indices: Reducer.DataPtrMap(usize) = .empty,
+        slice: []const *const Data = &.{},
+        next_index: usize = 0,
+        stage: Stage = .inited,
+
+        /// just for fun, you can even write something like this:
+        /// ```zig
+        /// const data_slice: []*const Data = ...;
+        /// var w_iter: WriteIterator = .init(ally, ctx);
+        /// defer w_iter.deinit()
+        ///
+        /// while (true) {
+        ///     switch(w_iter.stage) {
+        ///         .inited => try w_iter.setDataSlice(data_slice);
+        ///         .write_next => try w_iter.writeNext(),
+        ///         .write_pos_table => try w_iter.writePosTable(),
+        ///         .write_entry => try w_iter.writeEntry(),
+        ///         .done => break,
+        ///     }
+        /// }
+        /// ```
+        pub const Stage = enum {
+            inited,
+            write_next,
+            write_pos_table,
+            write_entry,
+            done,
+            deinited,
+        };
+
+        pub const WriteError = WriteErrorSet;
+        pub inline fn write(self: @This(), bytes: []const u8) WriteError!usize {
+            return writeFn(self.context, bytes);
+        }
+        pub const GetSeekPosError = GetSeekPosErrorSet;
+        pub inline fn getPos(self: @This()) GetSeekPosError!u64 {
+            return getPosFn(self.context);
+        }
+        pub const GetSeekPosOrWriteError = GetSeekPosError || WriteError;
+
+        pub const InternalWriter = std.io.Writer(Context, WriteErrorSet, writeFn);
+        pub inline fn internalWriter(self: @This()) InternalWriter {
+            return .{ .context = self.context };
+        }
+
+        pub fn init(gpa: Allocator, write_ctx: Context) @This() {
+            return .{ .context = write_ctx, .allocator = gpa };
+        }
+        /// should call `context.deinit()` manually if any.
+        pub fn deinit(self: *@This()) void {
+            self.stage = .deinited;
+            self.pos_table.deinit(self.allocator);
+            self.slice_indices.deinit(self.allocator);
+        }
+
+        /// set the data slice to be written, all referenced data must be in this slice.
+        pub fn setDataSlice(self: *@This(), slice: []const *const Data) Allocator.Error!void {
+            // stage: .inited, .done
+            assert(slice.len <= std.math.maxInt(u32));
+            self.slice = slice;
+            self.next_index = 0;
+
+            self.pos_table.clearRetainingCapacity();
+            try self.pos_table.ensureTotalCapacity(self.allocator, slice.len);
+
+            self.slice_indices.clearRetainingCapacity();
+            try self.slice_indices.ensureTotalCapacity(self.allocator, @truncate(slice.len));
+            for (slice, 0..) |data, index| {
+                self.slice_indices.putAssumeCapacity(@constCast(data), index);
+            }
+
+            self.stage = .write_next;
+        }
+
+        pub const InvalidDataError = error {
+            /// one or more ref data that refers to data is not contained in the given data slice
+            ReferencedDataNotInSlice,
+        };
+        /// ensure all data can be written. see `InvalidDataError` for possible invalid conditions.
+        ///
+        /// can be safely write data by using `writeNextAssumeValid` after this step.
+        pub fn ensureDataValid(self: @This()) InvalidDataError!void {
+            // stage: .write_next
+            for (self.slice) |data| {
+                // currently only ref data needs to check its validation
+                if (data.isRef() and !self.checkRefDataValid(data.*))
+                    return InvalidDataError.RefedDataNotInSlice;
+            }
+        }
+        fn checkRefDataValid(self: @This(), ref: Data) bool {
+            switch (ref) {
+                .pair => |p| {
+                    return self.contains(p.@"0") and self.contains(p.@"1");
+                },
+                .list => |l| {
+                    return for (l.val.items) |d| {
+                        if (!self.contains(d)) break false;
+                    } else true;
+                },
+                else => unreachable,
+            }
+        }
+
+        /// check the data slice contains the given data or not.
+        pub fn contains(self: @This(), data: *const Data) bool {
+            return self.slice_indices.contains(@constCast(data));
+        }
+
+        pub const NextWriteError = GetSeekPosOrWriteError || InvalidDataError;
+        /// write next data, return null if all data were written.
+        pub fn writeNext(self: *@This()) NextWriteError!?usize {
+            // stage: .write_next
+            if (self.next_index >= self.slice.len) {
+                self.stage = .write_pos_table;
+                return null;
+            }
+
+            const seek_pos = try self.getPos();
+            const data = self.slice[self.next_index];
+            const count = switch (data.*) {
+                .pair => |p| try self.writePair(p),
+                .list => |l| try self.writeList(l),
+                else => blk: {
+                    if (builtin.mode == .Debug) assert(!data.isRef());
+                    break :blk try data.writeValueIntoAssumeNotRef(self, WriteError);
+                },
+            };
+
+            self.pos_table.appendAssumeCapacity(seek_pos);
+            self.next_index += 1;
+            return count;
+        }
+        /// write next data, return null if all data were written.
+        /// you should call `ensureDataValid` to ensure all data is valid.
+        pub fn writeNextAssumeValid(self: *@This()) GetSeekPosOrWriteError!?usize {
+            if (self.next_index >= self.slice.len) return null;
+
+            const seek_pos = try self.getPos();
+            const data = self.slice[self.next_index];
+            const count = switch (self.slice[self.next_index]) {
+                .pair => |p| try self.writePairAssumeValid(p),
+                .list => |l| try self.writeListAssumeValid(l),
+                else => {
+                    if (builtin.mode == .Debug) assert(!data.isRef());
+                    try data.writeValueIntoAssumeNotRef(self, WriteError);
+                },
+            };
+
+            self.pos_table.appendAssumeCapacity(seek_pos);
+            self.next_index += 1;
+            return count;
+        }
+
+        fn writePair(self: @This(), pair: Data.Pair) (InvalidDataError || WriteError)!usize {
+            const tag: u8 = @intFromEnum(Data.Type.pair);
+            var count = try self.write((&tag)[0..1]);
+            count += try self.writeRefedIndex(pair.@"0");
+            count += try self.writeRefedIndex(pair.@"1");
+            return count;
+        }
+        fn writePairAssumeValid(self: @This(), pair: Data.Pair) WriteError!usize {
+            const tag: u8 = @intFromEnum(Data.Type.pair);
+            var count = try self.write((&tag)[0..1]);
+            count += try self.writeRefedIndexAssumeValid(pair.@"0");
+            count += try self.writeRefedIndexAssumeValid(pair.@"1");
+            return count;
+        }
+        fn writeList(self: @This(), list: Data.List) (InvalidDataError || WriteError)!usize {
+            const tag: u8 = @intFromEnum(Data.Type.list);
+            var count = try self.write((&tag)[0..1]);
+            count += try self.writeVarInt(list.val.items.len);
+            for (list.val.items) |data| count += try self.writeRefedIndex(data);
+            return count;
+        }
+        fn writeListAssumeValid(self: @This(), list: Data.List) (InvalidDataError || WriteError)!usize {
+            const tag: u8 = @intFromEnum(Data.Type.list);
+            var count = try self.write((&tag)[0..1]);
+            count += try self.writeVarInt(list.val.items.len);
+            for (list.val.items) |data| count += try self.writeRefedIndexAssumeValid(data);
+            return count;
+        }
+
+        fn writeRefedIndex(self: @This(), data: *const Data) (InvalidDataError || WriteError)!usize {
+            const idx = self.slice_indices.get(@constCast(data)) orelse
+                return InvalidDataError.ReferencedDataNotInSlice;
+            return self.writeVarInt(idx);
+        }
+        fn writeRefedIndexAssumeValid(self: @This(), data: *const Data) WriteError!usize {
+            const idx = self.slice_indices.get(@constCast(data)).?;
+            return self.writeVarInt(idx);
+        }
+
+        /// write the data position table, this method should be called after all data were written.
+        pub fn writePosTable(self: *@This()) GetSeekPosOrWriteError!usize {
+            // stage: .write_pos_table
+            self.table_pos = try self.getPos();
+            var count: usize = 0;
+            for (self.pos_table.items) |pos| count += try self.writeVarInt(pos);
+            self.stage = .write_entry;
+            return count;
+        }
+        /// write the entry of nyasdf (nyas Data Format), this method shold be called after `writePositionTable`.
+        pub fn writeEntry(self: *@This()) WriteError!usize {
+            // stage: .write_entry
+            assert(self.table_pos != null);
+            var count = try self.write(entry_label);
+            count += try self.writeVarInt(self.table_pos.?);
+            count += try self.writeVarInt(self.pos_table.items.len);
+            self.stage = .done;
+            return count;
+        }
+
+        fn writeVarInt(self: @This(), int: u64) WriteError!usize {
+            return writeVarIntInto(self, int, WriteError);
+        }
+
+        pub const WriteDirectError = NextWriteError || Allocator.Error;
+        /// directly write nyasdf (nyas Data Format) into `write_ctx` without fine control,
+        /// all referenced data must be in the given slice.
+        pub fn writeDirect(gpa: Allocator, write_ctx: Context, slice: []const *const Data) WriteDirectError!usize {
+            var self: @This() = .init(gpa, write_ctx);
+            defer self.deinit();
+            try self.setDataSlice(slice);
+
+            var count: usize = 0;
+            while (try self.writeNext()) |c| { count += c; }
+            count += try self.writePosTable();
+            count += try self.writeEntry();
+
+            return count;
+        }
+    };
+}
+
+pub const FileWriteIterator = WriteIterator(
+    std.fs.File,
+    std.fs.File.WriteError,
+    std.fs.File.write,
+    std.fs.File.GetSeekPosError,
+    std.fs.File.getPos,
+);
+
+
+pub fn ReadIterator(
+    comptime Context: type,
+    comptime ReadErrorSet: type,
+    comptime readFn: fn (ctx: Context, buffer: []u8) ReadErrorSet!usize,
+    comptime SeekErrorSet: type,
+    comptime seekToFn: fn (ctx: Context, pos: u64) SeekErrorSet!void,
+    comptime GetSeekPosErrorSet: type,
+    comptime getEndPosFn: fn(ctx: Context) GetSeekPosErrorSet!u64,
+) type {
+    return struct {
+        context: Context,
+        allocator: Allocator,
+        /// available after `findEntry` if entry was found
+        entry_pos: ?u64 = null,
+        /// available after `readEntry`
+        table_pos: ?u64 = null,
+        /// available after `readEntry`
+        data_count: usize = 0,
+        /// available after `readPosTable`
+        pos_table: std.ArrayListUnmanaged(u64) = .empty,
+        refs: std.ArrayListUnmanaged(IndexRefDataWithInfo) = .empty,
+        data_list: std.ArrayListUnmanaged(*Data) = .empty,
+        next_index: usize = 0,
+
+        pub const ReadError = ReadErrorSet;
+        pub inline fn read(self: @This(), buffer: []u8) ReadError!usize {
+            return readFn(self.context, buffer);
+        }
+        pub const SeekError = SeekErrorSet;
+        pub inline fn seekTo(self: @This(), pos: u64) SeekError!void {
+            return seekToFn(self.context, pos);
+        }
+        pub const GetSeekPosError = GetSeekPosErrorSet;
+        pub inline fn getEndPos(self: @This()) GetSeekPosError!u64 {
+            return getEndPosFn(self.context);
+        }
+        pub const ReadExpectError = GetReadExpectError(ReadError);
+        pub const SeekOrReadExpectError = SeekError || ReadExpectError;
+
+        pub const InternalReader = std.io.Reader(Context, ReadErrorSet, readFn);
+        pub inline fn internalReader(self: @This()) InternalReader {
+            return .{ .context = self.context };
+        }
+
+        pub fn init(gpa: Allocator, read_ctx: Context) @This() {
+            return .{ .context = read_ctx, .allocator = gpa };
+        }
+        pub fn deinit(self: *@This()) void {
+            self.pos_table.deinit(self.allocator);
+            self.refs.deinit(self.allocator);
+            destroyAllData(self.allocator, self.data_list.items);
+            self.data_list.deinit(self.allocator);
+        }
+
+        pub const FindEntryError = GetSeekPosError || SeekOrReadExpectError || Allocator.Error || error { EntryNotFound };
+        pub fn findEntry(self: *@This(), start: ?u64, length: usize) FindEntryError!void {
+            const end = try self.getEndPos();
+            const s_start = if (start) |s| @min(end, s) else if (end > length) end - length else 0;
+            const s_length: usize = @min(length, end - s_start);
+            if (s_length < entry_label.len) return FindEntryError.EntryNotFound;
+
+            const max_buffer_len = 4096; // = chunk_len + inherit_len
+
+            self.entry_pos = if (s_length < max_buffer_len) blk: {
+                const buffer = try self.allocator.alloc(u8, s_length);
+                defer self.allocator.free(buffer);
+
+                try self.seekTo(s_start);
+                try self.readExpect(buffer);
+
+                const idx = std.mem.lastIndexOf(u8, buffer, entry_label) orelse return FindEntryError.EntryNotFound;
+                break :blk s_start + idx;
+            }
+            else blk: { // search entry label by chunk from end to start
+                const inherit_len = entry_label.len - 1;
+                const chunk_len = max_buffer_len - inherit_len;
+
+                var remain_search_len = s_length;
+                var chunk_pos = s_start + s_length;
+
+                const buffer = try self.allocator.alloc(u8, max_buffer_len);
+                defer self.allocator.free(buffer);
+                const chunk = buffer[0..chunk_len];
+                const from_prev = buffer[chunk_len..];
+                const to_next = buffer[0..inherit_len];
+                for (from_prev) |*byte| byte.* = 0;
+
+                var curr_chunk_len: usize = undefined;
+                while (remain_search_len > 0) : (remain_search_len -= curr_chunk_len) {
+                    curr_chunk_len = @min(chunk_len, remain_search_len);
+                    const curr_chunk = chunk[(chunk_len - curr_chunk_len)..];
+
+                    chunk_pos -= curr_chunk_len;
+                    try self.seekTo(chunk_pos);
+                    try self.readExpect(curr_chunk);
+
+                    const search_range = curr_chunk[0..(curr_chunk_len + inherit_len)];
+                    if (std.mem.lastIndexOf(u8, search_range, entry_label)) |idx| break :blk chunk_pos + idx;
+
+                    @memcpy(from_prev, to_next);
+                } else return FindEntryError.EntryNotFound;
+            };
+        }
+
+        pub fn readEntry(self: *@This()) SeekOrReadExpectError!void {
+            try self.seekTo(self.entry_pos.? + entry_label.len);
+            self.table_pos = try self.readVarInt();
+            self.data_count = @intCast(try self.readVarInt());
+        }
+
+        pub const ReadPosTableError = SeekOrReadExpectError || Allocator.Error;
+        pub fn readPosTable(self: *@This()) ReadPosTableError!void {
+            self.pos_table.clearRetainingCapacity();
+            try self.pos_table.resize(self.allocator, self.data_count);
+            destroyAllData(self.allocator, self.data_list.items);
+            self.data_list.clearRetainingCapacity();
+            try self.data_list.ensureUnusedCapacity(self.allocator, self.data_count);
+            self.refs.clearRetainingCapacity();
+
+            try self.seekTo(self.table_pos.?);
+            for (self.pos_table.items) |*pos| {
+                pos.* = try self.readVarInt();
+            }
+        }
+
+        pub const DataFormatError = error {
+            InvalidDataTypeTag,
+            /// one or more ref data that refers to data is not in this nyasdf (nyas Data Format)
+            ReferencedDataOutOfRange,
+        };
+
+        pub const ReadNextEror = SeekOrReadExpectError || Allocator.Error || DataFormatError;
+        pub fn readNext(self: *@This()) ReadNextEror!bool {
+            if (self.next_index >= self.pos_table.items.len) {
+                if (self.refs.items.len > 0) return DataFormatError.ReferencedDataOutOfRange;
+                return false;
+            }
+
+            const data = try self.allocator.create(Data);
+            errdefer self.allocator.destroy(data);
+            try self.data_list.append(self.allocator, data);
+            errdefer _ = self.data_list.pop();
+            data.* = .{ .null = .{} };
+
+            const pos = self.pos_table.items[self.next_index];
+            try self.seekTo(pos);
+
+            var tag_byte: u8 = 0xFF;
+            try self.readExpect((&tag_byte)[0..1]);
+            const tag = std.enums.fromInt(Data.Type, tag_byte) orelse return DataFormatError.InvalidDataTypeTag;
+            switch (tag) {
+                .pair => try self.readPair(),
+                .list => try self.readList(),
+                else => {
+                    if (builtin.mode == .Debug) assert(!tag.isRef());
+                    data.* = try .readValueFromAllocWithTagAssumeNotRef(self.allocator, tag, self, ReadError);
+                },
+            }
+
+            try self.updateRefData();
+            self.next_index += 1;
+            return true;
+        }
+
+        fn readPair(self: *@This()) (SeekOrReadExpectError || Allocator.Error)!void {
+            const idx0: usize = @intCast(try self.readVarInt());
+            const idx1: usize = @intCast(try self.readVarInt());
+            try self.insertRef(.{
+                .max_index = @max(idx0, idx1),
+                .index_in_data_list = self.next_index,
+                .data = .{ .pair = .{ .@"0" = idx0, .@"1" = idx1 } },
+            });
+        }
+        fn readList(self: *@This()) (SeekOrReadExpectError || Allocator.Error)!void {
+            const list_len: usize = @intCast(try self.readVarInt());
+            var ref: IndexRefData = .{ .list = .{} };
+            try ref.list.val.resize(self.allocator, list_len);
+            errdefer ref.list.val.deinit(self.allocator);
+
+            var max_index: usize = 0;
+            for (ref.list.val.items) |*index| {
+                index.* = @intCast(try self.readVarInt());
+                max_index = @max(max_index, index.*);
+            }
+
+            try self.insertRef(.{
+                .max_index = max_index,
+                .index_in_data_list = self.next_index,
+                .data = ref,
+            });
+        }
+        fn insertRef(self: *@This(), ref_info: IndexRefDataWithInfo) Allocator.Error!void {
+            const insert_index = for (self.refs.items, 0..) |info, index| {
+                if (info.max_index <= ref_info.max_index) break index;
+            } else self.refs.items.len;
+            try self.refs.insert(self.allocator, insert_index, ref_info);
+        }
+
+        fn updateRefData(self: *@This()) Allocator.Error!void {
+            while(true) {
+                if (self.refs.items.len == 0) break;
+                var ref_info = self.refs.getLast();
+                if (ref_info.max_index > self.next_index) break;
+
+                self.data_list.items[ref_info.index_in_data_list].* = switch (ref_info.data) {
+                    .pair => |p| .{ .pair = .{
+                        .@"0" = self.data_list.items[p.@"0"],
+                        .@"1" = self.data_list.items[p.@"1"],
+                    } },
+
+                    .list => |*l| list: {
+                        var ref: Data = .{ .list = .{} };
+                        try ref.list.val.resize(self.allocator, l.val.items.len);
+                        errdefer ref.list.val.deinit(self.allocator);
+
+                        for (ref.list.val.items, l.val.items) |*r, i| r.* = self.data_list.items[i];
+                        l.val.deinit(self.allocator);
+
+                        break :list ref;
+                    },
+                };
+                self.refs.items.len -= 1;
+            }
+        }
+
+        pub fn takeDataList(self: *@This()) std.ArrayListUnmanaged(*Data) {
+            const taked = self.data_list;
+            self.data_list = .empty;
+            return taked;
+        }
+
+        fn readVarInt(self: @This()) ReadExpectError!u64 {
+            return readVarIntFrom(self, ReadError);
+        }
+        fn readExpect(self: @This(), buffer: []u8) ReadExpectError!void {
+            return readExpectFrom(self, buffer, ReadError);
+        }
+
+        pub const ReadDirectAllocError = GetSeekPosError || SeekOrReadExpectError || Allocator.Error || error { EntryNotFound } || DataFormatError;
+        pub fn readDirectAlloc(gpa: Allocator, read_ctx: Context) ReadDirectAllocError!std.ArrayListUnmanaged(*Data) {
+            var r_iter: @This() = .init(gpa, read_ctx);
+            defer r_iter.deinit();
+
+            try r_iter.findEntry(null, 1024);
+            try r_iter.readEntry();
+            try r_iter.readPosTable();
+            while (try r_iter.readNext()) {}
+
+            return r_iter.takeDataList();
+        }
+    };
+}
+
+/// use to destroy data read from `ReadIterator`
+pub fn destroyAllData(gpa: Allocator, slice: []const *Data) void {
+    for (slice) |data| {
+        switch (data.*) {
+            .null, .bool, .byte, .f16, .f32, .f64, .pair => {},
+            .int => |i| i.deinit(),
+            .list => |*l| l.val.deinit(gpa),
+            .bytes => |b| gpa.free(b.val),
+            .string => |s| gpa.free(s.val),
+        }
+        gpa.destroy(data);
+    }
+}
+
+pub const FileReadIterator = ReadIterator(
+    std.fs.File,
+    std.fs.File.ReadError,
+    std.fs.File.read,
+    std.fs.File.SeekError,
+    std.fs.File.seekTo,
+    std.fs.File.GetSeekPosError,
+    std.fs.File.getEndPos,
+);
+
+
+fn writeVarIntInto(writer: anytype, int: u64, comptime WriteError: type) WriteError!usize {
+    var i = int;
+    var b: u8 = @truncate(int & 0x7F);
+    var count = try writer.write((&b)[0..1]);
+    i >>= 7;
+
     while (i > 0) : (i >>= 7) {
-        const byte: u8 = 0x80 | @as(u8, @truncate(int & 0x7F));
-        try file.writeAll((&byte)[0..1]);
-        count += 1;
+        b = @truncate(0x80 | i);
+        count += try writer.write((&b)[0..1]);
     }
     return count;
 }
+fn readVarIntFrom(reader: anytype, comptime ReadError: type) GetReadExpectError(ReadError)!u64 {
+    var b: u8 = undefined;
+    try readExpectFrom(reader, (&b)[0..1], ReadError);
+    var i: u64 = b & 0x7F;
 
-fn readVarInt(file: File, comptime Int: type) File.ReadError!Int {
-    const info = @typeInfo(Int);
-    if (info != .int and info.int.signedness == .unsigned) @compileError("only accepts unsigned integer");
-
-    var byte: u8 = undefined;
-    _ = try file.readAll((&byte)[0..1]);
-    var int: Int = byte & 0x7F;
-    while (byte & 0x80 != 0) : (int = (int << 7) & (byte & 0x7F)) {
-        _ = try file.readAll((&byte)[0..1]);
+    while (b & 0x80 != 0) {
+        try readExpectFrom(reader, (&b)[0..1], ReadError);
+        i = (i << 7) | (b & 0x7F);
     }
-    return int;
+    return i;
 }
+
+pub fn GetReadExpectError(comptime ReadError: type) type {
+    return ReadError || error { EndOfStream };
+}
+fn readExpectFrom(reader: anytype, buffer: []u8, comptime ReadError: type) GetReadExpectError(ReadError)!void {
+    const read = try reader.read(buffer);
+    if (read != buffer.len) return error.EndOfStream;
+}
+
+const IndexRefData = union(enum) {
+    pair: IndexRefData.Pair,
+    list: IndexRefData.List,
+
+    const Pair = struct {
+        @"0": usize,
+        @"1": usize,
+    };
+
+    const List = struct {
+        val: std.ArrayListUnmanaged(usize) = .empty,
+    };
+};
+
+const IndexRefDataWithInfo = struct {
+    max_index: usize,
+    index_in_data_list: usize,
+    data: IndexRefData,
+};

@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 /// used to indicate the entry of nyasdf (nyas Data Format)
-pub const entry_label = "nyasdf";
+pub const entry_label = "nyasdf\x06\x07";
 
 
 pub const Data = union(Data.Type) {
@@ -126,6 +126,7 @@ pub const Data = union(Data.Type) {
         reader: anytype,
         comptime ReadError: type
     ) (GetReadExpectError(ReadError) || Allocator.Error)!Data {
+        assert(!tag.isRef());
         return switch (tag) {
             .null   => .{ .null   = try .readFrom(reader, ReadError) },
             .bool   => .{ .bool   = try .readFrom(reader, ReadError) },
@@ -461,7 +462,7 @@ pub const DataHashContext = struct {
 /// all non-duplicate data are moved to beginning of the slice given in `reduceStart`,
 /// and its length is stored in `keeping_count`.
 ///
-/// see also `reduceDirect` for directly reducion without fine control.
+/// see also `reduceDirect` for direct reducion without fine control.
 pub const Reducer = struct {
     allocator: Allocator,
     slice_indices: DataPtrMap(usize) = .empty,
@@ -650,7 +651,7 @@ pub const Reducer = struct {
 /// then call `writeNext` looply to write data util null is returned indicating that all data has been written,
 /// and finally call `writePosTable` and `writeEntry` to complete the nyasdf write.
 ///
-/// see also `writeDirect` for directly writing without fine control.
+/// see also `writeDirect` for direct writing without fine control.
 pub fn WriteIterator(
     comptime Context: type,
     comptime WriteErrorSet: type,
@@ -907,6 +908,11 @@ pub const FileWriteIterator = WriteIterator(
 );
 
 
+/// read nyasdf (nyas Data Format) from something, such as from file (see `FileReadIterator`).
+///
+/// fine control for reading is not so meaningful as writing, see `initDirect` and `takeDataList` for direct redaing.
+///
+/// elements in the result data list can be destroyed using `destroyAllData`.
 pub fn ReadIterator(
     comptime Context: type,
     comptime ReadErrorSet: type,
@@ -1032,18 +1038,9 @@ pub fn ReadIterator(
             }
         }
 
-        pub const DataFormatError = error {
-            InvalidDataTypeTag,
-            /// one or more ref data that refers to data is not in this nyasdf (nyas Data Format)
-            ReferencedDataOutOfRange,
-        };
-
-        pub const ReadNextEror = SeekOrReadExpectError || Allocator.Error || DataFormatError;
+        pub const ReadNextEror = SeekOrReadExpectError || Allocator.Error || error { InvalidDataTypeTag };
         pub fn readNext(self: *@This()) ReadNextEror!bool {
-            if (self.next_index >= self.pos_table.items.len) {
-                if (self.refs.items.len > 0) return DataFormatError.ReferencedDataOutOfRange;
-                return false;
-            }
+            if (self.next_index >= self.pos_table.items.len) return false;
 
             const data = try self.allocator.create(Data);
             errdefer self.allocator.destroy(data);
@@ -1056,7 +1053,7 @@ pub fn ReadIterator(
 
             var tag_byte: u8 = 0xFF;
             try self.readExpect((&tag_byte)[0..1]);
-            const tag = std.enums.fromInt(Data.Type, tag_byte) orelse return DataFormatError.InvalidDataTypeTag;
+            const tag = std.enums.fromInt(Data.Type, tag_byte) orelse return ReadNextEror.InvalidDataTypeTag;
             switch (tag) {
                 .pair => try self.readPair(),
                 .list => try self.readList(),
@@ -1066,7 +1063,7 @@ pub fn ReadIterator(
                 },
             }
 
-            try self.updateRefData();
+            try self.resolveRefData();
             self.next_index += 1;
             return true;
         }
@@ -1105,7 +1102,7 @@ pub fn ReadIterator(
             try self.refs.insert(self.allocator, insert_index, ref_info);
         }
 
-        fn updateRefData(self: *@This()) Allocator.Error!void {
+        fn resolveRefData(self: *@This()) Allocator.Error!void {
             while(true) {
                 if (self.refs.items.len == 0) break;
                 var ref_info = self.refs.getLast();
@@ -1132,7 +1129,20 @@ pub fn ReadIterator(
             }
         }
 
-        pub fn takeDataList(self: *@This()) std.ArrayListUnmanaged(*Data) {
+        pub const TakeDataListError = error {
+            /// ref data that refers to data not in this nyasdf (nyas Data Format)
+            ResolveRefDataFailed,
+        };
+        /// take the result data list. return `ResolveRefDataFailed` if some ref data cannot be resolved.
+        ///
+        /// see also `takeDataListAssumeSuccessResolvedRefData`.
+        pub fn takeDataList(self: *@This()) TakeDataListError!std.ArrayListUnmanaged(*Data) {
+            if (self.refs.items.len > 0) return TakeDataListError.ResolveRefDataFailed;
+            return self.takeDataListAssumeSuccessResolvedRefData();
+        }
+        /// take the result data list. assume all ref data is resolved,
+        /// ref data that cannot be resolved will be replaced by `Data.Null`.
+        pub fn takeDataListAssumeSuccessResolvedRefData(self: *@This()) std.ArrayListUnmanaged(*Data) {
             const taked = self.data_list;
             self.data_list = .empty;
             return taked;
@@ -1145,17 +1155,20 @@ pub fn ReadIterator(
             return readExpectFrom(self, buffer, ReadError);
         }
 
-        pub const ReadDirectAllocError = GetSeekPosError || SeekOrReadExpectError || Allocator.Error || error { EntryNotFound } || DataFormatError;
-        pub fn readDirectAlloc(gpa: Allocator, read_ctx: Context) ReadDirectAllocError!std.ArrayListUnmanaged(*Data) {
-            var r_iter: @This() = .init(gpa, read_ctx);
-            defer r_iter.deinit();
+        pub const InitDirectError = error {
+            EntryNotFound,
+            InvalidDataTypeTag,
+        } || GetSeekPosError || SeekOrReadExpectError || Allocator.Error;
+        pub fn initDirect(gpa: Allocator, read_ctx: Context) InitDirectError!@This() {
+            var self: @This() = .init(gpa, read_ctx);
+            errdefer self.deinit();
 
-            try r_iter.findEntry(null, 1024);
-            try r_iter.readEntry();
-            try r_iter.readPosTable();
-            while (try r_iter.readNext()) {}
+            try self.findEntry(null, 4096);
+            try self.readEntry();
+            try self.readPosTable();
+            while (try self.readNext()) {}
 
-            return r_iter.takeDataList();
+            return self;
         }
     };
 }
@@ -1186,16 +1199,20 @@ pub const FileReadIterator = ReadIterator(
 
 
 fn writeVarIntInto(writer: anytype, int: u64, comptime WriteError: type) WriteError!usize {
-    var i = int;
-    var b: u8 = @truncate(int & 0x7F);
-    var count = try writer.write((&b)[0..1]);
-    i >>= 7;
-
-    while (i > 0) : (i >>= 7) {
-        b = @truncate(0x80 | i);
-        count += try writer.write((&b)[0..1]);
+    var mask: u64 = 0x7F;
+    var count: u6 = 1;
+    while ((int & (~mask)) != 0) : (count += 1) {
+        mask = (mask << 7) | 0x7F;
     }
-    return count;
+    const result = count;
+    while (count > 1): (count -= 1) {
+        const shift = 7 * (count - 1);
+        const byte: u8 = @truncate((int >> shift) | 0x80);
+        _ = try writer.write((&byte)[0..1]);
+    }
+    const byte: u8 = @truncate(int & 0x7F);
+    _ = try writer.write((&byte)[0..1]);
+    return result;
 }
 fn readVarIntFrom(reader: anytype, comptime ReadError: type) GetReadExpectError(ReadError)!u64 {
     var b: u8 = undefined;

@@ -126,22 +126,14 @@ try w_iter.internalWriter().print("writing data ends", .{});
 
 Like `WriteIterator`, `nyasdf` also provides `ReadIterator` and `FileReadIterator`.
 
-Here is how to use it:
+Read nyasdf using `ReadIterator` will result a `DataPackage`, here is how to use it:
 
 ```zig
-var reader: FileReadIterator = try .initDirect(allocator, file);
-defer reader.deinit();
-var data_list = try reader.takeDataList(); // note `std.ArrayListUnmanaged` needs to be variable to call `deinit`
+const pack = try nyasdf.FileReadIterator.readDirect(allocator, file);
+defer pack.deinit();
 ```
 
-Due to the complicate allocacation, free `data_list` properly can be done by:
-
-```zig
-defer {
-    nyasdf.destroyAllData(allocator, data_list.items);
-    data_list.deinit(allocator);
-}
-```
+and accessing `Data` using `pack.list.items[...]`.
 
 Although `ReadIterator` also has fine control APIs likes `WriteIterator`, but the use case is very unclear, so not recommand to use it.
 
@@ -151,4 +143,4 @@ Although `ReadIterator` also has fine control APIs likes `WriteIterator`, but th
 
 - convert json to nyasdf, and back (? convert nyasdf back to json need to check loop references, and I don't know how to do it properly)
 
-- convert zig types to nyasdf (very useful for small object, but it make no sense for large object, even for `std.ArrayList)
+- convert zig types to nyasdf (very useful for small object, but it make no sense for large object, even for `std.ArrayList`)

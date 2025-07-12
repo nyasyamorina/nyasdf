@@ -443,6 +443,59 @@ pub const Data = union(Data.Type) {
 };
 
 
+/// a warpper of `std.ArrayList`, use this `deinit` to free data list instead of `list.deinit`
+pub const DataPackage = struct {
+    list: std.ArrayList(*Data),
+
+    pub fn deinit(self: DataPackage) void {
+        destroyAllData(self.list.allocator, self.list.items);
+        self.list.deinit();
+    }
+};
+
+/// collect all referenced data began with `entry_data`, you must ensure all data (pointers) all valid.
+/// the `entry_data` will be the first elements in returned list.
+pub fn collectDataSliceAlloc(gpa: Allocator, entry_data: *const Data) Allocator.Error![]*const Data {
+    if (!entry_data.isRef()) {
+        const list = try gpa.alloc(*const Data, 1);
+        list[0] = @constCast(entry_data);
+        return list;
+    }
+
+    var collected: DataPtrMap(void) = .empty;
+    defer collected.deinit(gpa);
+    {
+        var stack: std.ArrayListUnmanaged(*const Data) = .empty;
+        defer stack.deinit(gpa);
+        try stack.append(gpa, entry_data);
+
+        while (stack.pop()) |data| {
+            const e = try collected.getOrPut(gpa, @constCast(data));
+            if (e.found_existing or !data.isRef()) continue;
+            switch (data.*) {
+                .pair => |p| try stack.appendSlice(gpa, &.{ p.@"0", p.@"1" }),
+                .list => |l| try stack.appendSlice(gpa, l.val.items),
+                else => unreachable,
+            }
+        }
+    }
+
+    var list: std.ArrayListUnmanaged(*const Data) = .empty;
+    errdefer list.deinit(gpa);
+    try list.ensureTotalCapacityPrecise(gpa, collected.size);
+
+    _ = collected.remove(@constCast(entry_data));
+    list.appendAssumeCapacity(entry_data);
+    var iter = collected.keyIterator();
+    while (iter.next()) |data| list.appendAssumeCapacity(data.*);
+
+    assert(list.items.len == list.capacity);
+    const result = list.items;
+    list = .empty;
+    return result;
+}
+
+
 pub const DataHashContext = struct {
     pub fn hash(_: DataHashContext, data: Data) u64 {
         var hasher: std.hash.Wyhash = .init(0);
@@ -488,19 +541,7 @@ pub const Reducer = struct {
             return DataHashContext.eql(undefined, data1.*, data2.*);
         }
     };
-    const DataPtrHashContext = struct {
-        pub fn hash(_: DataPtrHashContext, data: *Data) u64 {
-            return @intFromPtr(data); // extream performance, but what's the cost?
-        }
-        pub fn eql(_: DataPtrHashContext, data1: *Data, data2: *Data) bool {
-            return data1 == data2;
-        }
-    };
-
     const DataSet = std.HashMapUnmanaged(*Data, void, CachedDataHashContext, std.hash_map.default_max_load_percentage);
-    fn DataPtrMap(comptime T: type) type {
-        return std.HashMapUnmanaged(*Data, T, DataPtrHashContext, std.hash_map.default_max_load_percentage);
-    }
 
     pub fn init(gpa: Allocator) Reducer {
         return .{ .allocator = gpa, .slice = &.{} };
@@ -665,7 +706,7 @@ pub fn WriteIterator(
         /// available after `writePosTable`
         table_pos: ?u64 = null,
         pos_table: std.ArrayListUnmanaged(u64) = .empty,
-        slice_indices: Reducer.DataPtrMap(usize) = .empty,
+        slice_indices: DataPtrMap(usize) = .empty,
         slice: []const *const Data = &.{},
         next_index: usize = 0,
         stage: Stage = .inited,
@@ -728,7 +769,7 @@ pub fn WriteIterator(
             self.next_index = 0;
 
             self.pos_table.clearRetainingCapacity();
-            try self.pos_table.ensureTotalCapacity(self.allocator, slice.len);
+            try self.pos_table.ensureTotalCapacityPrecise(self.allocator, slice.len);
 
             self.slice_indices.clearRetainingCapacity();
             try self.slice_indices.ensureTotalCapacity(self.allocator, @truncate(slice.len));
@@ -773,7 +814,7 @@ pub fn WriteIterator(
             return self.slice_indices.contains(@constCast(data));
         }
 
-        pub const NextWriteError = GetSeekPosOrWriteError || InvalidDataError;
+        pub const NextWriteError = GetSeekPosOrWriteError || InvalidDataError || Allocator.Error;
         /// write next data, return null if all data were written.
         pub fn writeNext(self: *@This()) NextWriteError!?usize {
             // stage: .write_next
@@ -793,7 +834,7 @@ pub fn WriteIterator(
                 },
             };
 
-            self.pos_table.appendAssumeCapacity(seek_pos);
+            try self.pos_table.append(self.allocator, seek_pos); // user may manipulated `slice` after `setDataSlice`
             self.next_index += 1;
             return count;
         }
@@ -910,7 +951,7 @@ pub const FileWriteIterator = WriteIterator(
 
 /// read nyasdf (nyas Data Format) from something, such as from file (see `FileReadIterator`).
 ///
-/// fine control for reading is not so meaningful as writing, see `initDirect` and `takeDataList` for direct redaing.
+/// fine control for reading is not so meaningful as writing, see `readDirect` for direct redaing.
 ///
 /// elements in the result data list can be destroyed using `destroyAllData`.
 pub fn ReadIterator(
@@ -961,10 +1002,20 @@ pub fn ReadIterator(
             return .{ .context = read_ctx, .allocator = gpa };
         }
         pub fn deinit(self: *@This()) void {
+            self.destroyRefAndData();
             self.pos_table.deinit(self.allocator);
             self.refs.deinit(self.allocator);
-            destroyAllData(self.allocator, self.data_list.items);
             self.data_list.deinit(self.allocator);
+        }
+
+        fn destroyRefAndData(self: @This()) void {
+            for (self.refs.items) |ref| {
+                switch (ref.data) {
+                    .pair => {},
+                    .list => |l| self.allocator.free(l.val.allocatedSlice()),
+                }
+            }
+            destroyAllData(self.allocator, self.data_list.items);
         }
 
         pub const FindEntryError = GetSeekPosError || SeekOrReadExpectError || Allocator.Error || error { EntryNotFound };
@@ -1025,11 +1076,12 @@ pub fn ReadIterator(
 
         pub const ReadPosTableError = SeekOrReadExpectError || Allocator.Error;
         pub fn readPosTable(self: *@This()) ReadPosTableError!void {
+            self.destroyRefAndData();
             self.pos_table.clearRetainingCapacity();
-            try self.pos_table.resize(self.allocator, self.data_count);
-            destroyAllData(self.allocator, self.data_list.items);
+            try self.pos_table.ensureTotalCapacityPrecise(self.allocator, self.data_count);
+            self.pos_table.items.len = self.data_count;
             self.data_list.clearRetainingCapacity();
-            try self.data_list.ensureUnusedCapacity(self.allocator, self.data_count);
+            try self.data_list.ensureTotalCapacityPrecise(self.allocator, self.data_count);
             self.refs.clearRetainingCapacity();
 
             try self.seekTo(self.table_pos.?);
@@ -1044,7 +1096,7 @@ pub fn ReadIterator(
 
             const data = try self.allocator.create(Data);
             errdefer self.allocator.destroy(data);
-            try self.data_list.append(self.allocator, data);
+            try self.data_list.append(self.allocator, data); // user may manipulated `pos_table` after `readPosTable`
             errdefer _ = self.data_list.pop();
             data.* = .{ .null = .{} };
 
@@ -1129,23 +1181,23 @@ pub fn ReadIterator(
             }
         }
 
-        pub const TakeDataListError = error {
+        pub const TakeDataError = error {
             /// ref data that refers to data not in this nyasdf (nyas Data Format)
-            ResolveRefDataFailed,
+            ReferencedDataNotFound,
         };
-        /// take the result data list. return `ResolveRefDataFailed` if some ref data cannot be resolved.
+        /// take the result data package. return `ResolveRefDataFailed` if some ref data cannot be resolved.
         ///
-        /// see also `takeDataListAssumeSuccessResolvedRefData`.
-        pub fn takeDataList(self: *@This()) TakeDataListError!std.ArrayListUnmanaged(*Data) {
-            if (self.refs.items.len > 0) return TakeDataListError.ResolveRefDataFailed;
-            return self.takeDataListAssumeSuccessResolvedRefData();
+        /// see also `takeDataListAssumeSuccess`.
+        pub fn takeData(self: *@This()) TakeDataError!DataPackage {
+            if (self.refs.items.len > 0) return TakeDataError.ReferencedDataNotFound;
+            return self.takeDataAssumeSuccess();
         }
-        /// take the result data list. assume all ref data is resolved,
-        /// ref data that cannot be resolved will be replaced by `Data.Null`.
-        pub fn takeDataListAssumeSuccessResolvedRefData(self: *@This()) std.ArrayListUnmanaged(*Data) {
-            const taked = self.data_list;
+        /// take the result data package. assume all data is resolved,
+        /// data that cannot be resolved will be replaced by `Data.Null`.
+        pub fn takeDataAssumeSuccess(self: *@This()) DataPackage {
+            const data_list = self.data_list.toManaged(self.allocator);
             self.data_list = .empty;
-            return taked;
+            return .{ .list = data_list };
         }
 
         fn readVarInt(self: @This()) ReadExpectError!u64 {
@@ -1170,21 +1222,24 @@ pub fn ReadIterator(
 
             return self;
         }
-    };
-}
 
-/// use to destroy data read from `ReadIterator`
-pub fn destroyAllData(gpa: Allocator, slice: []const *Data) void {
-    for (slice) |data| {
-        switch (data.*) {
-            .null, .bool, .byte, .f16, .f32, .f64, .pair => {},
-            .int => |i| i.deinit(),
-            .list => |*l| l.val.deinit(gpa),
-            .bytes => |b| gpa.free(b.val),
-            .string => |s| gpa.free(s.val),
+        pub const ReadDirectError = InitDirectError || TakeDataError;
+        /// directly read nyasdf (nyas Data Format)
+        pub fn readDirect(gpa: Allocator, read_ctx: Context) ReadDirectError!DataPackage {
+            var self: @This() = try .initDirect(gpa, read_ctx);
+            defer self.deinit();
+            return self.takeData();
         }
-        gpa.destroy(data);
-    }
+
+        pub const ReadDirectAssumeSuccessError = InitDirectError;
+        /// directly read nyasdf (nyas Data Format), assume all data resolved succefully,
+        /// data that cannot be resolved will be replaced by `Data.Null`.
+        pub fn readDirectAssumeSuccess(gpa: Allocator, read_ctx: Context) ReadDirectAssumeSuccessError!DataPackage {
+            var self: @This() = try .initDirect(gpa, read_ctx);
+            defer self.deinit();
+            return self.takeDataAssumeSuccess();
+        }
+    };
 }
 
 pub const FileReadIterator = ReadIterator(
@@ -1253,3 +1308,27 @@ const IndexRefDataWithInfo = struct {
     index_in_data_list: usize,
     data: IndexRefData,
 };
+
+fn destroyAllData(gpa: Allocator, slice: []const *Data) void {
+    for (slice) |data| {
+        switch (data.*) {
+            .null, .bool, .byte, .f16, .f32, .f64, .pair => {},
+            .int => |i| i.deinit(),
+            .list => |*l| l.val.deinit(gpa),
+            .bytes => |b| gpa.free(b.val),
+            .string => |s| gpa.free(s.val),
+        }
+        gpa.destroy(data);
+    }
+}
+
+fn DataPtrMap(comptime T: type) type {
+    return std.HashMapUnmanaged(*Data, T, struct {
+        pub fn hash(_: @This(), data: *Data) u64 {
+            return @intFromPtr(data); // extream performance, but what's the cost?
+        }
+        pub fn eql(_: @This(), data1: *Data, data2: *Data) bool {
+            return data1 == data2;
+        }
+    }, std.hash_map.default_max_load_percentage);
+}

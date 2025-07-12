@@ -14,9 +14,6 @@ const expectEqualStrings = std.testing.expectEqualStrings;
 
 
 test "nyasdf.Data" {
-    var gpa = std.heap.DebugAllocator(.{}).init;
-    defer _ = gpa.deinit();
-
     const d1: nyasData = .{.bool = .{.val = true}};
     try expectEqual(true, d1.bool.val);
 
@@ -32,7 +29,7 @@ test "nyasdf.Data" {
     const d5: nyasData = .{.f64 = .{.val = 64.0}};
     try expectEqual(64.0, d5.f64.val);
 
-    var d6: nyasData = .{.int = .init(gpa.allocator())};
+    var d6: nyasData = .{.int = .init(std.testing.allocator)};
     defer d6.deinit();
     try d6.int.set(@as(i42, -42));
     try expectEqual(@as(i42, -42), d6.int.get(i42));
@@ -59,9 +56,6 @@ test "nyasdf.Data" {
 }
 
 test "nyasdf.Reducer" {
-    var gpa = std.heap.DebugAllocator(.{}).init;
-    defer _ = gpa.deinit();
-
     var d0: nyasData = .{.byte = .{.val = 0}};
     var d1: nyasData = .{.pair = undefined};
     var d2: nyasData = .{.pair = undefined};
@@ -77,16 +71,17 @@ test "nyasdf.Reducer" {
     var d5_val = [_]*const nyasData {&d0, &d6, &d1, &d2, &d3, &d4};
     d5.list = .{.val = .fromOwnedSlice(&d5_val)};
 
-    var df = [_]*nyasData {&d0, &d1, &d2, &d3, &d4, &d5, &d6};
+    const df: []*nyasData = @ptrCast(try nyasdf.collectDataSliceAlloc(std.testing.allocator, &d5));
+    defer std.testing.allocator.free(df);
 
-    var reducer: Reducer = .init(gpa.allocator());
+    var reducer: Reducer = .init(std.testing.allocator);
     defer reducer.deinit();
-    if (try reducer.reduceStart(&df)) {
+    if (try reducer.reduceStart(df)) {
         while (try reducer.reduceContinue()) {}
     }
     const reduced_df = reducer.keepingSlice();
 
-    try expectEqual(&df, reduced_df.ptr);
+    try expectEqual(df.ptr, reduced_df.ptr);
     try expectEqual(4, reduced_df.len);
     try expect(std.mem.indexOfScalar(*nyasData, reduced_df, &d0) != null);
     try expect(std.mem.indexOfScalar(*nyasData, reduced_df, &d1) != null);
@@ -141,31 +136,21 @@ test "write / read" {
         const file = try std.fs.cwd().openFile("test.nyasdf", .{});
         defer file.close();
 
-        var reader: nyasdf.FileReadIterator = try .initDirect(allocator, file);
-        defer reader.deinit();
-        var data_list = try reader.takeDataList();
-        defer {
-            nyasdf.destroyAllData(allocator, data_list.items);
-            data_list.deinit(allocator);
-        }
+        const pack = try nyasdf.FileReadIterator.readDirect(allocator, file);
+        defer pack.deinit();
 
-        try expectEqual(0xFF, data_list.items[0].byte.val);
-        try expectEqualSlices(u8, &.{1, 2, 3, 4}, data_list.items[1].bytes.val);
-        try expectEqualStrings("The quick brown fox jumps over the lazy dog", data_list.items[2].string.val);
-        try expectEqual(0x123456789, data_list.items[3].int.get(i42));
-        try expectEqual(-0x123456789, data_list.items[4].int.get(i42));
-        try expectEqual(@as(f32, 42.0), data_list.items[5].f32.val);
-        try expectEqual(@as(f64, 42.0), data_list.items[6].f64.val);
-        try expectEqual(data_list.items[2], data_list.items[7].pair.@"0");
-        try expectEqual(data_list.items[4], data_list.items[7].pair.@"1");
+        try expectEqual(0xFF, pack.list.items[0].byte.val);
+        try expectEqualSlices(u8, &.{1, 2, 3, 4}, pack.list.items[1].bytes.val);
+        try expectEqualStrings("The quick brown fox jumps over the lazy dog", pack.list.items[2].string.val);
+        try expectEqual(0x123456789, pack.list.items[3].int.get(i42));
+        try expectEqual(-0x123456789, pack.list.items[4].int.get(i42));
+        try expectEqual(@as(f32, 42.0), pack.list.items[5].f32.val);
+        try expectEqual(@as(f64, 42.0), pack.list.items[6].f64.val);
+        try expectEqual(pack.list.items[2], pack.list.items[7].pair.@"0");
+        try expectEqual(pack.list.items[4], pack.list.items[7].pair.@"1");
         const ref_to_idx = [_]usize {0, 3, 4, 5, 6};
         var ref_to: [ref_to_idx.len]*const nyasData = undefined;
-        for (&ref_to, ref_to_idx) |*to, idx| to.* = data_list.items[idx];
-        try expectEqualSlices(*const nyasData, &ref_to, data_list.items[8].list.val.items);
+        for (&ref_to, ref_to_idx) |*to, idx| to.* = pack.list.items[idx];
+        try expectEqualSlices(*const nyasData, &ref_to, pack.list.items[8].list.val.items);
     }
-}
-
-
-test "A" {
-
 }

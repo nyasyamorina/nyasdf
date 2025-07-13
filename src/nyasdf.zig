@@ -1,6 +1,5 @@
 const builtin = @import("builtin");
 const std = @import("std");
-
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
@@ -54,7 +53,7 @@ pub const Data = union(Data.Type) {
         switch (self) {
             inline else => |payload| {
                 payload.updateHash(hasher);
-            }
+            },
         }
     }
 
@@ -82,7 +81,7 @@ pub const Data = union(Data.Type) {
             inline else => |payload| {
                 const Payload = @TypeOf(payload);
                 if (@hasDecl(Payload, "deinit")) payload.deinit();
-            }
+            },
         }
     }
 
@@ -124,7 +123,7 @@ pub const Data = union(Data.Type) {
         gpa: Allocator,
         tag: Data.Type,
         reader: anytype,
-        comptime ReadError: type
+        comptime ReadError: type,
     ) (GetReadExpectError(ReadError) || Allocator.Error)!Data {
         assert(!tag.isRef());
         return switch (tag) {
@@ -141,14 +140,20 @@ pub const Data = union(Data.Type) {
         };
     }
 
-    pub const Null = struct{
+    pub const Null = struct {
         pub inline fn updateHash(_: Data.Null, _: anytype) void {}
 
-        pub inline fn eql(_: Data.Null, _: Data.Null) bool { return true; }
+        pub inline fn eql(_: Data.Null, _: Data.Null) bool {
+            return true;
+        }
 
-        pub inline fn writeInto(_: Data.Null, _: anytype, comptime _: type) error{}!usize { return 0; }
+        pub inline fn writeInto(_: Data.Null, _: anytype, comptime _: type) error{}!usize {
+            return 0;
+        }
 
-        pub inline fn readFrom(_: anytype, comptime _: type) error{}!Data.Null { return .{}; }
+        pub inline fn readFrom(_: anytype, comptime _: type) error{}!Data.Null {
+            return .{};
+        }
     };
 
     pub const Bool = struct {
@@ -283,7 +288,7 @@ pub const Data = union(Data.Type) {
         pub fn readFromAlloc(
             gpa: Allocator,
             reader: anytype,
-            comptime ReadError: type
+            comptime ReadError: type,
         ) (GetReadExpectError(ReadError) || Allocator.Error)!Data.Bytes {
             const len: usize = @intCast(try readVarIntFrom(reader, ReadError));
             const self: Data.Bytes = .{ .val = try gpa.alloc(u8, len) };
@@ -313,7 +318,7 @@ pub const Data = union(Data.Type) {
         pub fn readFromAlloc(
             gpa: Allocator,
             reader: anytype,
-            comptime ReadError: type
+            comptime ReadError: type,
         ) (GetReadExpectError(ReadError) || Allocator.Error)!Data.String {
             const len: usize = @intCast(try readVarIntFrom(reader, ReadError));
             const self: Data.String = .{ .val = try gpa.allocSentinel(u8, len, 0) };
@@ -357,7 +362,7 @@ pub const Data = union(Data.Type) {
         pub fn readFromAlloc(
             gpa: Allocator,
             reader: anytype,
-            comptime ReadError: type
+            comptime ReadError: type,
         ) (GetReadExpectError(ReadError) || Allocator.Error)!Data.Int {
             const len_neg: usize = @intCast(try readVarIntFrom(reader, ReadError));
             var self: Data.Int = .init(gpa);
@@ -406,7 +411,7 @@ pub const Data = union(Data.Type) {
             var bit_count = 8 * self.buffer.items.len - last_byte_leading_zero_bit_count + @intFromBool(self.negative);
             // check for negative power of 2
             if (self.negative and std.math.isPowerOfTwo(self.buffer.getLast())) {
-                for (self.buffer.items[0..self.buffer.items.len-1]) |byte| {
+                for (self.buffer.items[0 .. self.buffer.items.len - 1]) |byte| {
                     if (byte != 0) break;
                 } else bit_count -= 1;
             }
@@ -482,7 +487,7 @@ pub fn collectDataSliceAlloc(gpa: Allocator, entry_data: *const Data) Allocator.
 
     var list: std.ArrayListUnmanaged(*const Data) = .empty;
     errdefer list.deinit(gpa);
-    try list.ensureTotalCapacityPrecise(gpa, collected.size);
+    try list.ensureTotalCapacityPrecise(gpa, collected.count());
 
     _ = collected.remove(@constCast(entry_data));
     list.appendAssumeCapacity(entry_data);
@@ -584,7 +589,7 @@ pub const Reducer = struct {
             }
         }
 
-        if (self.replaces.size == 0) return false;
+        if (self.replaces.count() == 0) return false;
         self.applyReplacesToRefs();
         self.rearrangeSlice();
         return true;
@@ -609,7 +614,7 @@ pub const Reducer = struct {
             }
         }
 
-        if (self.replaces.size == 0) return false;
+        if (self.replaces.count() == 0) return false;
         self.applyReplacesToRefs();
         self.rearrangeSlice();
         return true;
@@ -931,7 +936,7 @@ pub fn WriteIterator(
             try self.setDataSlice(slice);
 
             var count: usize = 0;
-            while (try self.writeNext()) |c| { count += c; }
+            while (try self.writeNext()) |c| count += c;
             count += try self.writePosTable();
             count += try self.writeEntry();
 
@@ -961,7 +966,7 @@ pub fn ReadIterator(
     comptime SeekErrorSet: type,
     comptime seekToFn: fn (ctx: Context, pos: u64) SeekErrorSet!void,
     comptime GetSeekPosErrorSet: type,
-    comptime getEndPosFn: fn(ctx: Context) GetSeekPosErrorSet!u64,
+    comptime getEndPosFn: fn (ctx: Context) GetSeekPosErrorSet!u64,
 ) type {
     return struct {
         context: Context,
@@ -1036,8 +1041,7 @@ pub fn ReadIterator(
 
                 const idx = std.mem.lastIndexOf(u8, buffer, entry_label) orelse return FindEntryError.EntryNotFound;
                 break :blk s_start + idx;
-            }
-            else blk: { // search entry label by chunk from end to start
+            } else blk: { // search entry label by chunk from end to start
                 const inherit_len = entry_label.len - 1;
                 const chunk_len = max_buffer_len - inherit_len;
 
@@ -1155,7 +1159,7 @@ pub fn ReadIterator(
         }
 
         fn resolveRefData(self: *@This()) Allocator.Error!void {
-            while(true) {
+            while (true) {
                 if (self.refs.items.len == 0) break;
                 var ref_info = self.refs.getLast();
                 if (ref_info.max_index > self.next_index) break;
@@ -1168,8 +1172,9 @@ pub fn ReadIterator(
 
                     .list => |*l| list: {
                         var ref: Data = .{ .list = .{} };
-                        try ref.list.val.resize(self.allocator, l.val.items.len);
+                        try ref.list.val.ensureTotalCapacityPrecise(self.allocator, l.val.items.len);
                         errdefer ref.list.val.deinit(self.allocator);
+                        ref.list.val.items.len = l.val.items.len;
 
                         for (ref.list.val.items, l.val.items) |*r, i| r.* = self.data_list.items[i];
                         l.val.deinit(self.allocator);
@@ -1260,7 +1265,7 @@ fn writeVarIntInto(writer: anytype, int: u64, comptime WriteError: type) WriteEr
         mask = (mask << 7) | 0x7F;
     }
     const result = count;
-    while (count > 1): (count -= 1) {
+    while (count > 1) : (count -= 1) {
         const shift = 7 * (count - 1);
         const byte: u8 = @truncate((int >> shift) | 0x80);
         _ = try writer.write((&byte)[0..1]);
@@ -1332,3 +1337,6 @@ fn DataPtrMap(comptime T: type) type {
         }
     }, std.hash_map.default_max_load_percentage);
 }
+
+
+pub const convert = @import("convert.zig");

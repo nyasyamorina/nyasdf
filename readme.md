@@ -137,10 +137,29 @@ and accessing `Data` using `pack.list.items[...]`.
 
 Although `ReadIterator` also has fine control APIs likes `WriteIterator`, but the use case is very unclear, so not recommand to use it.
 
+## convert
+
+This is the submodule `nyasdf.convert`
+
+### fromJsonValue
+
+Collect json values to `DataPackage`:
+
+```zig
+const json_value: std.json.Value = ...;
+
+const pack = try nyasdf.convert.fromJsonValue(allocator, json_value);
+defer pack.deinit();
+```
+
+Note that json values with `.number_string` tag will convert to `Data.String`, see `std.json.ParseOptions.parse_numbers` for more infomation.
+
 ----
 
 ### TODO
 
-- convert json to nyasdf, and back (? convert nyasdf back to json need to check loop references, and I don't know how to do it properly)
+- convert json to nyasdf (add func take `std.json.Scanner` or `std.json.Reader` and build `DataPackage` without using `std.json.Value`), and back (? convert nyasdf back to json need to check loop references, and I don't know how to do it properly)
 
 - convert zig types to nyasdf (very useful for small object, but it make no sense for large object, even for `std.ArrayList`)
+
+- `DataPackage` should use `ArenaAllocator` to manage memory to allow not copy string strategy in `serialize.fromJsonValue`

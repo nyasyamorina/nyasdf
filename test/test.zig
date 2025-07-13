@@ -154,3 +154,35 @@ test "write / read" {
         try expectEqualSlices(*const nyasData, &ref_to, pack.list.items[8].list.val.items);
     }
 }
+
+test "from json" {
+    const json_text =
+    \\{
+    \\    "name": "Alice",
+    \\    "age": 16,
+    \\    "interest": [
+    \\        "gaming",
+    \\        "movie"
+    \\    ]
+    \\}
+    ;
+
+    const json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_text, .{});
+    defer json.deinit();
+
+    const pack = try nyasdf.convert.fromJsonValue(std.testing.allocator, json.value);
+    defer pack.deinit();
+
+    try expect(pack.list.items.len > 0);
+    const json_entry = pack.list.items[0].list.val.items;
+    try expectEqual(3, json_entry.len);
+    try expectEqualStrings("name", json_entry[0].pair.@"0".string.val);
+    try expectEqualStrings("Alice", json_entry[0].pair.@"1".string.val);
+    try expectEqualStrings("age", json_entry[1].pair.@"0".string.val);
+    try expectEqual(16, json_entry[1].pair.@"1".int.get(i64));
+    try expectEqualStrings("interest", json_entry[2].pair.@"0".string.val);
+    const interest_items = json_entry[2].pair.@"1".list.val.items;
+    try expectEqual(2, interest_items.len);
+    try expectEqualStrings("gaming", interest_items[0].string.val);
+    try expectEqualStrings("movie", interest_items[1].string.val);
+}

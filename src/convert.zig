@@ -290,7 +290,7 @@ fn newDataFromToken(
         }
     };
 
-    try data_list.ensureTotalCapacity(1);
+    try data_list.ensureUnusedCapacity(1);
     const data = try allocator.create(Data);
     data_list.appendAssumeCapacity(data);
     data.* = .{ .null = .{} };

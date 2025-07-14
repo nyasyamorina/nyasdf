@@ -223,3 +223,34 @@ test "from json file" {
         try testJson(pack);
     }
 }
+
+
+test "an example for converting json file to nyasdf file" {
+    const in_file = try std.fs.cwd().openFile("test.total.json", .{});
+    defer in_file.close();
+
+    var reader = std.json.reader(std.testing.allocator, in_file.reader());
+    defer reader.deinit();
+
+    const pack = try std.json.parseFromTokenSourceLeaky(nyasdf.DataPackage, std.testing.allocator, &reader, .{});
+    defer pack.deinit();
+    const entry = pack.list.items[0];
+
+    const total_data = pack.list.items.len;
+    std.debug.print("total data: {d}\n", .{total_data});
+
+    const keeping_data = try nyasdf.Reducer.reduceDirect(std.testing.allocator, pack.list.items, null);
+    std.debug.print("keeping data: {d}\n", .{keeping_data});
+
+    const keeping_slice = pack.list.items[0..keeping_data];
+    const entry_index = std.mem.indexOfScalar(*nyasData, keeping_slice, entry);
+    if (entry_index.? != 0) {
+        std.mem.swap(*nyasData, &keeping_slice[0], &keeping_slice[entry_index.?]);
+    }
+
+    const out_file = try std.fs.cwd().createFile("test.total.nyasdf", .{});
+    defer out_file.close();
+
+    _ = try nyasdf.FileWriteIterator.writeDirect(std.testing.allocator, out_file, keeping_slice);
+    return error.A; // zig test will not show debug print if success, so, just thow an error
+}

@@ -80,7 +80,7 @@ pub const Data = union(Data.Type) {
         switch (self) {
             inline else => |payload| {
                 const Payload = @TypeOf(payload);
-                if (@hasDecl(Payload, "deinit")) payload.deinit();
+                if (std.meta.hasFn(Payload, "deinit")) payload.deinit();
             },
         }
     }
@@ -107,7 +107,7 @@ pub const Data = union(Data.Type) {
 
         switch (self) {
             inline else => |payload| {
-                if (@hasDecl(@TypeOf(payload), "writeInto")) {
+                if (std.meta.hasFn(@TypeOf(payload), "writeInto")) {
                     const payload_len = try payload.writeInto(writer, WriteError);
                     return tag_len + payload_len;
                 } else unreachable;
@@ -455,6 +455,16 @@ pub const DataPackage = struct {
     pub fn deinit(self: DataPackage) void {
         destroyAllData(self.list.allocator, self.list.items);
         self.list.deinit();
+    }
+
+    /// connect to `std.json.parseFromValueLeaky`
+    pub fn jsonParseFromValue(allocator: Allocator, source: std.json.Value, _: std.json.ParseOptions) Allocator.Error!DataPackage {
+        return convert.fromJsonValue(allocator, source);
+    }
+
+    /// connect to `std.json.parseFromTokenSourceLeaky`
+    pub fn jsonParse(allocator: Allocator, source: anytype, opts: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!DataPackage {
+        return convert.fromJsonTokenSource(allocator, source, opts);
     }
 };
 

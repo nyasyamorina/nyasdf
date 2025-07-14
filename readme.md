@@ -154,11 +154,38 @@ defer pack.deinit();
 
 Note that json values with `.number_string` tag will convert to `Data.String`, see `std.json.ParseOptions.parse_numbers` for more infomation.
 
+### fromJsonTokenSource
+
+Take a `std.json.Scanner` or a `std.json.Reader` and parse directly to `DataPackage`. calling this function by user is not recommanded.
+
+If json file is available, use following code to parse to nyasdf:
+
+```zig
+const file: std.fs.File = ...;
+
+var reader = std.json.reader(allocator, file.reader());
+defer reader.deinit();
+
+const pack = try std.json.parseFromTokenSourceLeaky(nyasdf.DataPackage, allocator, &reader, .{});
+defer pack.deinit();
+```
+
+If json text string is available, the following code is prety handy:
+
+```zig
+const pack: nyasdf.DataPackage = try std.json.parseFromSliceLeaky(nyasdf.DataPackage, std.testing.allocator, json_text, .{});
+defer pack.deinit();
+```
+
+Note that even if `options.parse_numbers` is `true` (default), number will still parse into `Data.String` if the number string is invalid (contains invalid characters or overflow from `i64`).
+
 ----
 
 ### TODO
 
-- convert json to nyasdf (add func take `std.json.Scanner` or `std.json.Reader` and build `DataPackage` without using `std.json.Value`), and back (? convert nyasdf back to json need to check loop references, and I don't know how to do it properly)
+- convert nyasdf back to json (? convert nyasdf back to json need to check loop references, and I don't know how to do it properly)
+
+- parse number string to `Data.Int` directly to support arbitrary big integer
 
 - convert zig types to nyasdf (very useful for small object, but it make no sense for large object, even for `std.ArrayList`)
 

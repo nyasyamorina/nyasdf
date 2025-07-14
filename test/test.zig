@@ -155,8 +155,7 @@ test "write / read" {
     }
 }
 
-test "from json" {
-    const json_text =
+const json_text =
     \\{
     \\    "name": "Alice",
     \\    "age": 16,
@@ -165,14 +164,9 @@ test "from json" {
     \\        "movie"
     \\    ]
     \\}
-    ;
+;
 
-    const json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_text, .{});
-    defer json.deinit();
-
-    const pack = try nyasdf.convert.fromJsonValue(std.testing.allocator, json.value);
-    defer pack.deinit();
-
+fn testJson(pack: nyasdf.DataPackage) !void {
     try expect(pack.list.items.len > 0);
     const json_entry = pack.list.items[0].list.val.items;
     try expectEqual(3, json_entry.len);
@@ -185,4 +179,47 @@ test "from json" {
     try expectEqual(2, interest_items.len);
     try expectEqualStrings("gaming", interest_items[0].string.val);
     try expectEqualStrings("movie", interest_items[1].string.val);
+    //return error.A;
+}
+
+test "from json value" {
+    const json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_text, .{});
+    defer json.deinit();
+
+    // the following 3 lines are identical
+    //const pack = try nyasdf.convert.fromJsonValue(std.testing.allocator, json.value);
+    //const pack = try std.json.parseFromValueLeaky(nyasdf.DataPackage, std.testing.allocator, json.value, .{});
+    const pack: nyasdf.DataPackage = try .jsonParseFromValue(std.testing.allocator, json.value, .{});
+    defer pack.deinit();
+
+    try testJson(pack);
+}
+
+test "from json slice" {
+    const pack: nyasdf.DataPackage = try std.json.parseFromSliceLeaky(nyasdf.DataPackage, std.testing.allocator, json_text, .{});
+    defer pack.deinit();
+
+    try testJson(pack);
+}
+
+test "from json file" {
+    const json_name = "test.json";
+    {
+        const file = try std.fs.cwd().createFile(json_name, .{});
+        defer file.close();
+
+        _ = try file.write(json_text);
+    }
+    {
+        const file = try std.fs.cwd().openFile(json_name, .{});
+        defer file.close();
+
+        var reader = std.json.reader(std.testing.allocator, file.reader());
+        defer reader.deinit();
+
+        const pack: nyasdf.DataPackage = try std.json.parseFromTokenSourceLeaky(nyasdf.DataPackage, std.testing.allocator, &reader, .{});
+        defer pack.deinit();
+
+        try testJson(pack);
+    }
 }

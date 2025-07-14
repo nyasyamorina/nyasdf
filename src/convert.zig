@@ -7,6 +7,7 @@ const nyasdf = @import("nyasdf.zig");
 const Data = nyasdf.Data;
 const DataPackage = nyasdf.DataPackage;
 
+
 const CoValue = struct {
     n: *Data,
     j: *const json.Value,
@@ -153,6 +154,213 @@ pub fn fromJsonValue(allocator: Allocator, value: json.Value) Allocator.Error!Da
         } else {
             stack.items.len -= 1;
         }
+    }
+    return pack;
+}
+
+
+const ListLikeHandler = union(enum) {
+    array: Array,
+    object: Object,
+
+    fn handleNext(
+        self: ListLikeHandler,
+        data_list: *std.ArrayList(*Data),
+        stack: *std.ArrayListUnmanaged(ListLikeHandler),
+        source: anytype,
+        opts: json.ParseOptions,
+    ) json.ParseError(@TypeOf(source.*))!void {
+        switch (self) {
+            inline else => |h| try h.handleNext(data_list, stack, source, opts),
+        }
+    }
+
+    const Array = struct {
+        n: *Data,
+
+        fn handleNext(
+            self: ListLikeHandler.Array,
+            data_list: *std.ArrayList(*Data),
+            stack: *std.ArrayListUnmanaged(ListLikeHandler),
+            source: anytype,
+            opts: json.ParseOptions,
+        ) json.ParseError(@TypeOf(source.*))!void {
+            const allocator = data_list.allocator;
+            const token: json.Token = try source.nextAllocMax(allocator, .alloc_always, opts.max_value_len.?);
+            switch (token) {
+                .end_of_document, .object_end => return error.UnexpectedToken,
+
+                .array_end => {
+                    assert(stack.items.len > 0);
+                    switch (stack.getLast()) {
+                        .array => |a| assert(a.n == self.n),
+                        else => unreachable,
+                    }
+                    stack.items.len -= 1;
+                },
+
+                else => {
+                    const ele = try newDataFromToken(data_list, stack, token, opts);
+                    try self.n.list.val.append(allocator, ele);
+                },
+            }
+
+        }
+    };
+
+    const Object = struct {
+        n: *Data,
+
+        fn handleNext(
+            self: ListLikeHandler.Object,
+            data_list: *std.ArrayList(*Data),
+            stack: *std.ArrayListUnmanaged(ListLikeHandler),
+            source: anytype,
+            opts: json.ParseOptions,
+        ) json.ParseError(@TypeOf(source.*))!void {
+            const allocator = data_list.allocator;
+            const token: json.Token = try source.nextAllocMax(allocator, .alloc_always, opts.max_value_len.?);
+            switch (token) {
+                .end_of_document, .array_end => return error.UnexpectedToken,
+
+                .object_end => {
+                    assert(stack.items.len > 0);
+                    switch (stack.getLast()) {
+                        .object => |o| assert(o.n == self.n),
+                        else => unreachable,
+                    }
+                    stack.items.len -= 1;
+                },
+
+                .allocated_string => |s| {
+                    var need_to_free = true;
+                    defer if (need_to_free) allocator.free(s);
+
+                    try data_list.ensureUnusedCapacity(2);
+                    const pair = try allocator.create(Data);
+                    data_list.appendAssumeCapacity(pair);
+                    pair.* = .{ .pair = .{ .@"0" = pair, .@"1" = pair } };
+                    try self.n.list.val.append(allocator, pair);
+
+                    const key = try allocator.create(Data);
+                    data_list.appendAssumeCapacity(key);
+                    pair.pair.@"0" = key;
+                    if (s.len > 0 and s[s.len - 1] == 0) {
+                        key.* = .{ .string = .{ .val = @ptrCast(s[0 .. s.len - 1]) } };
+                        need_to_free = false;
+                    } else {
+                        key.* = .{ .string = .{ .val = try allocator.dupeZ(u8, s) } };
+                    }
+
+                    const value_token: json.Token = try source.nextAllocMax(allocator, .alloc_always, opts.max_value_len.?);
+                    switch (value_token) {
+                        .object_end, .array_end, .end_of_document => return error.UnexpectedToken,
+                        else => {
+                            const value = try newDataFromToken(data_list, stack, value_token, opts);
+                            pair.pair.@"1" = value;
+                        },
+                    }
+                },
+
+                .allocated_number => |n| {
+                    allocator.free(n);
+                    return error.UnexpectedToken;
+                },
+
+                else => return error.UnexpectedToken,
+            }
+        }
+    };
+};
+
+fn newDataFromToken(
+    data_list: *std.ArrayList(*Data),
+    stack: *std.ArrayListUnmanaged(ListLikeHandler),
+    token: json.Token,
+    opts: json.ParseOptions,
+) Allocator.Error!*Data {
+    const allocator = data_list.allocator;
+
+    var need_to_free = true;
+    defer if (need_to_free) {
+        switch (token) {
+            .allocated_string => |s| allocator.free(s),
+            .allocated_number => |n| allocator.free(n),
+            else => {},
+        }
+    };
+
+    try data_list.ensureTotalCapacity(1);
+    const data = try allocator.create(Data);
+    data_list.appendAssumeCapacity(data);
+    data.* = .{ .null = .{} };
+
+    data.* = t: switch (token) {
+        .true => .{ .bool = .{ .val = true } },
+        .false => .{ .bool = .{ .val = false } },
+        .null => .{ .null = .{} },
+
+        .object_begin => blk: {
+            try stack.append(allocator, .{ .object = .{ .n = data } });
+            break :blk .{ .list = .{} };
+        },
+
+        .array_begin => blk: {
+            try stack.append(allocator, .{ .array = .{ .n = data } });
+            break :blk .{ .list = .{} };
+        },
+
+        .allocated_string => |s| blk: {
+            if (s.len > 0 and s[s.len - 1] == 0) {
+                const string: Data.String = .{ .val = @ptrCast(s[0 .. s.len - 1]) };
+                need_to_free = false;
+                break :blk .{ .string = string };
+            } else {
+                const str = try allocator.dupeZ(u8, s);
+                break :blk .{ .string = .{ .val = str } };
+            }
+        },
+
+        .allocated_number => |n| blk: {
+            if (opts.parse_numbers) {
+                if (json.isNumberFormattedLikeAnInteger(n)) {
+                    if (std.fmt.parseInt(i64, n, 10)) |i| {
+                        var int: Data.Int = .init(allocator);
+                        errdefer int.deinit();
+                        try int.set(i);
+                        break :blk .{ .int = int };
+                    } else |_| {} // continue to .allocated_string
+                } else {
+                    if (std.fmt.parseFloat(f64, n)) |f| {
+                        break :blk .{ .f64 = .{ .val = f } };
+                    } else |_| {} // continue to .allocated_string
+                }
+            }
+            continue :t .{ .allocated_string = n };
+        },
+
+        else => unreachable,
+    };
+    return data;
+}
+
+/// you may want to use `std.json.parseFromSliceLeaky` or `std.json.parseFromTokenSourceLeaky`
+pub fn fromJsonTokenSource(allocator: Allocator, source: anytype, opts: json.ParseOptions) json.ParseError(@TypeOf(source.*))!DataPackage {
+    var pack: DataPackage = .{ .list = .init(allocator) };
+    errdefer pack.deinit();
+
+    var stack: std.ArrayListUnmanaged(ListLikeHandler) = .empty;
+    defer stack.deinit(allocator);
+
+    const token: json.Token = try source.nextAllocMax(allocator, .alloc_always, opts.max_value_len.?);
+    switch (token) {
+        .end_of_document => return pack,
+        .object_end, .array_end => return error.UnexpectedToken,
+        else => _ = try newDataFromToken(&pack.list, &stack, token, opts),
+    }
+
+    while (stack.items.len > 0) {
+        try stack.getLast().handleNext(&pack.list, &stack, source, opts);
     }
     return pack;
 }

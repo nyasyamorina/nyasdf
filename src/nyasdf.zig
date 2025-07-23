@@ -761,7 +761,7 @@ pub fn WriteIterator(
         }
         pub const GetSeekPosOrWriteError = GetSeekPosError || WriteError;
 
-        pub const InternalWriter = std.io.Writer(Context, WriteErrorSet, writeFn);
+        pub const InternalWriter = std.io.GenericWriter(Context, WriteErrorSet, writeFn);
         pub inline fn internalWriter(self: @This()) InternalWriter {
             return .{ .context = self.context };
         }
@@ -1008,7 +1008,7 @@ pub fn ReadIterator(
         pub const ReadExpectError = GetReadExpectError(ReadError);
         pub const SeekOrReadExpectError = SeekError || ReadExpectError;
 
-        pub const InternalReader = std.io.Reader(Context, ReadErrorSet, readFn);
+        pub const InternalReader = std.io.GenericReader(Context, ReadErrorSet, readFn);
         pub inline fn internalReader(self: @This()) InternalReader {
             return .{ .context = self.context };
         }

@@ -4,13 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const nyasdf = b.addStaticLibrary(.{
-        .name = "nyasdf",
+    const nyasdf = b.addModule("nyasdf", .{
         .root_source_file = b.path("src/nyasdf.zig"),
         .target = target,
         .optimize = optimize,
     });
-    b.installArtifact(nyasdf);
 
 
     const test_module = b.createModule(.{
@@ -18,7 +16,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    test_module.addImport("nyasdf", nyasdf.root_module);
+    test_module.addImport("nyasdf", nyasdf);
 
     const mod_tests = b.addTest(.{ .root_module = test_module });
     const run_mod_tests = b.addRunArtifact(mod_tests);

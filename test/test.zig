@@ -214,7 +214,7 @@ test "from json file" {
         const file = try std.fs.cwd().openFile(json_name, .{});
         defer file.close();
 
-        var reader = std.json.reader(std.testing.allocator, file.reader());
+        var reader = std.json.reader(std.testing.allocator, file.deprecatedReader());
         defer reader.deinit();
 
         const pack: nyasdf.DataPackage = try std.json.parseFromTokenSourceLeaky(nyasdf.DataPackage, std.testing.allocator, &reader, .{});
@@ -229,7 +229,7 @@ test "an example for converting json file to nyasdf file" {
     const in_file = try std.fs.cwd().openFile("test.total.json", .{});
     defer in_file.close();
 
-    var reader = std.json.reader(std.testing.allocator, in_file.reader());
+    var reader = std.json.reader(std.testing.allocator, in_file.deprecatedReader());
     defer reader.deinit();
 
     const pack = try std.json.parseFromTokenSourceLeaky(nyasdf.DataPackage, std.testing.allocator, &reader, .{});

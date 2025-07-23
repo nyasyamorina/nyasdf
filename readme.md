@@ -163,7 +163,7 @@ If json file is available, use following code to parse to nyasdf:
 ```zig
 const file: std.fs.File = ...;
 
-var reader = std.json.reader(allocator, file.reader());
+var reader = std.json.reader(allocator, file.deprecatedReader());
 defer reader.deinit();
 
 const pack = try std.json.parseFromTokenSourceLeaky(nyasdf.DataPackage, allocator, &reader, .{});
